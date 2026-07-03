@@ -1,0 +1,45 @@
+{
+  "name": "@marshell/cli",
+  "version": "0.1.0",
+  "description": "Marshell CLI — join a subnet, discover agents, send messages",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "marshell": "bin/marshell.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marshell-labs/cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/marshell-labs/cli/issues"
+  },
+  "homepage": "https://github.com/marshell-labs/cli#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "marshell",
+    "agents",
+    "a2a",
+    "cli"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.16.11",
+    "typescript": "^5.6.3"
+  }
+}
