@@ -164,19 +164,58 @@ async function cmdAgentJoin(args: string[]): Promise<void> {
   printError(result.message);
 }
 
+const AUTO_REPLY_TIMEOUT_MS = 45_000;
+
+function killProcessTree(pid: number | undefined): void {
+  if (!pid) return;
+  if (process.platform === "win32") {
+    spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ignore
+    }
+  }
+}
+
 function runCommandCapture(
   command: string,
   args: string[],
-  options?: { cwd?: string },
+  options?: { cwd?: string; timeoutMs?: number },
 ): Promise<{ code: number; stdout: string; stderr: string }> {
+  const timeoutMs = options?.timeoutMs ?? AUTO_REPLY_TIMEOUT_MS;
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd: options?.cwd,
       env: process.env,
       shell: process.platform === "win32",
+      detached: process.platform !== "win32",
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const finish = (code: number, errText?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        code,
+        stdout,
+        stderr: errText ? `${stderr}\n${errText}`.trim() : stderr,
+      });
+    };
+    const timer = setTimeout(() => {
+      killProcessTree(child.pid);
+      finish(124, `timeout after ${Math.round(timeoutMs / 1000)}s`);
+    }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
@@ -184,10 +223,10 @@ function runCommandCapture(
       stderr += chunk.toString();
     });
     child.on("close", (code) => {
-      resolve({ code: code ?? 1, stdout, stderr });
+      finish(code ?? 1);
     });
     child.on("error", (error) => {
-      resolve({ code: 1, stdout, stderr: error.message });
+      finish(1, error.message);
     });
   });
 }
@@ -209,16 +248,21 @@ async function generateAutoReply(
   ].join("\n");
 
   if (runtime === "cursor") {
+    // ask mode is read-only and much faster than full agent --force
     const result = await runCommandCapture("agent", [
       "-p",
       "--trust",
-      "--force",
+      "--mode",
+      "ask",
       "--workspace",
       workspace,
       "--output-format",
       "text",
       prompt,
     ]);
+    if (result.code === 124) {
+      throw new Error("auto-reply timed out (45s)");
+    }
     if (result.code !== 0) {
       throw new Error(result.stderr || result.stdout || "cursor agent failed");
     }
@@ -226,6 +270,9 @@ async function generateAutoReply(
   }
 
   const result = await runCommandCapture("hermes", ["-z", prompt]);
+  if (result.code === 124) {
+    throw new Error("auto-reply timed out (45s)");
+  }
   if (result.code !== 0) {
     throw new Error(result.stderr || result.stdout || "hermes failed");
   }
