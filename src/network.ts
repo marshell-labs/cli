@@ -135,12 +135,19 @@ export async function joinAgent(
 export async function discoverPeers(
   baseUrl: string,
 ): Promise<{ peers: Array<Record<string, unknown>> }> {
+  const config = await readConfig();
+  const headers: Record<string, string> = {};
+  if (config.token) {
+    headers.authorization = `Bearer ${config.token}`;
+  }
+
   const candidates = ["/v1/peers", "/v1/discover"];
 
   for (const path of candidates) {
     try {
       const response = await fetch(withPath(baseUrl, path), {
         method: "GET",
+        headers,
       });
       if (response.status === 404) {
         continue;
