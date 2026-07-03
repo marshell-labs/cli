@@ -234,13 +234,15 @@ export async function sendMessage(
 
 export async function fetchInbox(
   baseUrl: string,
+  options?: { peek?: boolean },
 ): Promise<
   | { kind: "ok"; messages: InboxMessage[]; agent: string }
   | { kind: "error"; message: string; status?: number }
 > {
   try {
     const headers = await authHeaders("agent");
-    const response = await fetch(withPath(baseUrl, "/v1/messages/inbox"), {
+    const qs = options?.peek ? "?peek=1" : "";
+    const response = await fetch(withPath(baseUrl, `/v1/messages/inbox${qs}`), {
       method: "GET",
       headers,
     });
@@ -271,6 +273,32 @@ export async function fetchInbox(
   }
 }
 
+export async function ackMessages(
+  baseUrl: string,
+  ids: string[],
+): Promise<{ kind: "ok"; acked: number } | { kind: "error"; message: string }> {
+  if (ids.length === 0) {
+    return { kind: "ok", acked: 0 };
+  }
+  try {
+    const headers = await authHeaders("agent");
+    const result = await postJson<{ acked?: number; error?: string }>(
+      withPath(baseUrl, "/v1/messages/ack"),
+      { ids },
+      headers,
+    );
+    if (result.status >= 200 && result.status < 300) {
+      return { kind: "ok", acked: result.data.acked ?? ids.length };
+    }
+    return {
+      kind: "error",
+      message: result.data.error ?? `Ack failed with HTTP ${result.status}.`,
+    };
+  } catch (error) {
+    return { kind: "error", message: (error as Error).message };
+  }
+}
+
 export async function waitForInbox(
   baseUrl: string,
   options: { waitSeconds: number; from?: string },
@@ -283,7 +311,7 @@ export async function waitForInbox(
   const from = options.from?.toLowerCase();
 
   while (Date.now() < deadline) {
-    const result = await fetchInbox(baseUrl);
+    const result = await fetchInbox(baseUrl, { peek: true });
     if (result.kind === "error") {
       return result;
     }
@@ -293,6 +321,10 @@ export async function waitForInbox(
       : result.messages;
 
     if (messages.length > 0) {
+      await ackMessages(
+        baseUrl,
+        messages.map((m) => m.id),
+      );
       return { kind: "ok", messages, agent: result.agent };
     }
 

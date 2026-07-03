@@ -1,13 +1,16 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { hostname } from "node:os";
 import { getConfigPath, getNetworkUrl, patchConfig, readConfig } from "./config";
 import {
+  ackMessages,
   discoverPeers,
   fetchInbox,
   joinAgent,
   pingNetwork,
   sendMessage,
   waitForInbox,
+  type InboxMessage,
 } from "./network";
 
 type JsonShape = Record<string, unknown>;
@@ -20,16 +23,17 @@ function printHelp(): void {
     "  marshell auth set <token> [--name <name>]",
     "  marshell auth status [--json]",
     "  marshell agent join --name <name>",
-    "  marshell agent run",
+    "  marshell agent run [--auto-reply] [--workspace <path>] [--runtime cursor|hermes]",
     "  marshell discover [--json]",
     "  marshell send --to <name> --text \"...\" [--json]",
     "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
-    "  marshell listen [--json] [--wait <seconds>]",
+    "  marshell listen [--json] [--wait <seconds>] [--auto-reply]",
     "  marshell --help",
     "",
     "Environment:",
     "  MARSHELL_NETWORK_URL  default: https://network.marshell.dev",
     "  MARSHELL_AGENT_NAME   default agent name for auth set",
+    "  MARSHELL_WORKSPACE    workspace for --auto-reply (cursor runtime)",
     "  MARSHELL_CONFIG       optional path to config file",
   ].join("\n");
   process.stdout.write(`${message}\n`);
@@ -160,11 +164,127 @@ async function cmdAgentJoin(args: string[]): Promise<void> {
   printError(result.message);
 }
 
-async function cmdAgentRun(): Promise<void> {
+function runCommandCapture(
+  command: string,
+  args: string[],
+  options?: { cwd?: string },
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd: options?.cwd,
+      env: process.env,
+      shell: process.platform === "win32",
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.on("close", (code) => {
+      resolve({ code: code ?? 1, stdout, stderr });
+    });
+    child.on("error", (error) => {
+      resolve({ code: 1, stdout, stderr: error.message });
+    });
+  });
+}
+
+async function generateAutoReply(
+  msg: InboxMessage,
+  runtime: "cursor" | "hermes",
+  workspace: string,
+): Promise<string> {
+  const prompt = [
+    `Another Marshell agent named "${msg.from}" sent you this request.`,
+    "Answer it using the local workspace/codebase.",
+    "Do NOT run marshell CLI commands — your stdout is delivered automatically as the reply.",
+    "Do NOT mention Ask mode, Agent mode, tools, or that you are an AI.",
+    "Reply with ONLY the answer text. No preamble.",
+    "",
+    "Request:",
+    msg.text,
+  ].join("\n");
+
+  if (runtime === "cursor") {
+    const result = await runCommandCapture("agent", [
+      "-p",
+      "--trust",
+      "--force",
+      "--workspace",
+      workspace,
+      "--output-format",
+      "text",
+      prompt,
+    ]);
+    if (result.code !== 0) {
+      throw new Error(result.stderr || result.stdout || "cursor agent failed");
+    }
+    return result.stdout.trim();
+  }
+
+  const result = await runCommandCapture("hermes", ["-z", prompt]);
+  if (result.code !== 0) {
+    throw new Error(result.stderr || result.stdout || "hermes failed");
+  }
+  return result.stdout.trim();
+}
+
+async function handleInboundMessage(
+  networkUrl: string,
+  msg: InboxMessage,
+  autoReply: boolean,
+  runtime: "cursor" | "hermes",
+  workspace: string,
+): Promise<void> {
+  process.stdout.write(`[message] from=${msg.from} id=${msg.id}\n${msg.text}\n`);
+
+  if (!autoReply) {
+    await ackMessages(networkUrl, [msg.id]);
+    return;
+  }
+
+  try {
+    process.stdout.write(`[auto-reply] generating response via ${runtime}…\n`);
+    const reply = await generateAutoReply(msg, runtime, workspace);
+    if (!reply) {
+      throw new Error("empty reply from runtime");
+    }
+    const sent = await sendMessage(networkUrl, msg.from, reply);
+    if (sent.kind !== "sent") {
+      throw new Error(sent.message);
+    }
+    process.stdout.write(
+      `[auto-reply] sent to ${msg.from} (id: ${sent.id})\n`,
+    );
+    await ackMessages(networkUrl, [msg.id]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[auto-reply] failed: ${message}\n`);
+    // leave message in inbox for retry
+  }
+}
+
+async function cmdAgentRun(args: string[] = []): Promise<void> {
+  const autoReply = hasFlag(args, "--auto-reply");
+  const workspace =
+    valueForFlag(args, "--workspace") ??
+    process.env.MARSHELL_WORKSPACE ??
+    process.cwd();
+  const runtimeFlag = valueForFlag(args, "--runtime");
+  const runtime: "cursor" | "hermes" =
+    runtimeFlag === "hermes" || runtimeFlag === "cursor"
+      ? runtimeFlag
+      : process.platform === "win32"
+        ? "cursor"
+        : "hermes";
+
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
   process.stdout.write(
-    `Listening as '${config.agentName ?? "agent"}'. Polling inbox…\n`,
+    `Listening as '${config.agentName ?? "agent"}'${autoReply ? ` (auto-reply via ${runtime})` : ""}.\n`,
   );
 
   let stopped = false;
@@ -178,13 +298,17 @@ async function cmdAgentRun(): Promise<void> {
   process.on("SIGTERM", cleanup);
 
   while (!stopped) {
-    const result = await fetchInbox(networkUrl);
+    const result = await fetchInbox(networkUrl, { peek: true });
     if (result.kind === "error") {
       process.stderr.write(`inbox error: ${result.message}\n`);
     } else {
       for (const msg of result.messages) {
-        process.stdout.write(
-          `[message] from=${msg.from} id=${msg.id}\n${msg.text}\n`,
+        await handleInboundMessage(
+          networkUrl,
+          msg,
+          autoReply,
+          runtime,
+          workspace,
         );
       }
     }
@@ -311,8 +435,7 @@ async function cmdListen(args: string[]): Promise<void> {
     return;
   }
 
-  // Continuous listen
-  await cmdAgentRun();
+  await cmdAgentRun(args);
 }
 
 async function main(): Promise<void> {
@@ -350,7 +473,7 @@ async function main(): Promise<void> {
     }
 
     if (sub === "run") {
-      await cmdAgentRun();
+      await cmdAgentRun(rest);
       return;
     }
 
