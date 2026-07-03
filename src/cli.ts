@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { hostname } from "node:os";
 import { getConfigPath, getNetworkUrl, patchConfig, readConfig } from "./config";
 import {
   discoverPeers,
@@ -15,7 +16,7 @@ function printHelp(): void {
     "marshell - Phase 0 CLI",
     "",
     "Usage:",
-    "  marshell auth set <token>",
+    "  marshell auth set <token> [--name <name>]",
     "  marshell auth status [--json]",
     "  marshell agent join --name <name>",
     "  marshell agent run",
@@ -25,9 +26,30 @@ function printHelp(): void {
     "",
     "Environment:",
     "  MARSHELL_NETWORK_URL  default: https://network.marshell.dev",
+    "  MARSHELL_AGENT_NAME   default agent name for auth set",
     "  MARSHELL_CONFIG       optional path to config file",
   ].join("\n");
   process.stdout.write(`${message}\n`);
+}
+
+function sanitizeAgentName(raw: string): string {
+  const cleaned = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+  return cleaned || "agent";
+}
+
+function defaultAgentName(existing?: string): string {
+  if (process.env.MARSHELL_AGENT_NAME?.trim()) {
+    return sanitizeAgentName(process.env.MARSHELL_AGENT_NAME);
+  }
+  if (existing?.trim()) {
+    return sanitizeAgentName(existing);
+  }
+  const host = hostname().split(".")[0] ?? "agent";
+  return sanitizeAgentName(host);
 }
 
 function printJson(payload: JsonShape): void {
@@ -52,13 +74,37 @@ function valueForFlag(args: string[], flag: string): string | undefined {
 }
 
 async function cmdAuthSet(args: string[]): Promise<void> {
-  const token = args[0];
-  if (!token) {
-    printError("Usage: marshell auth set <token>");
+  const named = valueForFlag(args, "--name");
+  const tokenArg = args.filter((a, i) => {
+    if (a.startsWith("--")) return false;
+    if (i > 0 && args[i - 1] === "--name") return false;
+    return true;
+  })[0];
+
+  if (!tokenArg) {
+    printError("Usage: marshell auth set <token> [--name <name>]");
   }
 
-  await patchConfig({ token });
+  const config = await readConfig();
+  const name = named ? sanitizeAgentName(named) : defaultAgentName(config.agentName);
+
+  await patchConfig({ token: tokenArg });
   process.stdout.write(`Saved token to ${getConfigPath()}\n`);
+
+  const networkUrl = getNetworkUrl(await readConfig());
+  const result = await joinAgent(networkUrl, name);
+
+  if (result.kind === "joined") {
+    await patchConfig({ agentKey: result.agentKey, agentName: name });
+    process.stdout.write(`Joined network as '${name}'. Agent key saved.\n`);
+    return;
+  }
+
+  if (result.kind === "not_found") {
+    printError("Join API not found on network. Check MARSHELL_NETWORK_URL.");
+  }
+
+  printError(result.message);
 }
 
 async function cmdAuthStatus(args: string[]): Promise<void> {
