@@ -3,10 +3,11 @@ import { hostname } from "node:os";
 import { getConfigPath, getNetworkUrl, patchConfig, readConfig } from "./config";
 import {
   discoverPeers,
+  fetchInbox,
   joinAgent,
   pingNetwork,
   sendMessage,
-  toWsUrl,
+  waitForInbox,
 } from "./network";
 
 type JsonShape = Record<string, unknown>;
@@ -22,6 +23,8 @@ function printHelp(): void {
     "  marshell agent run",
     "  marshell discover [--json]",
     "  marshell send --to <name> --text \"...\" [--json]",
+    "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
+    "  marshell listen [--json] [--wait <seconds>]",
     "  marshell --help",
     "",
     "Environment:",
@@ -157,83 +160,36 @@ async function cmdAgentJoin(args: string[]): Promise<void> {
   printError(result.message);
 }
 
-function setupHeartbeat(message: string): NodeJS.Timeout {
-  process.stdout.write(`${message}\n`);
-  return setInterval(() => {
-    process.stdout.write(`[heartbeat] ${new Date().toISOString()}\n`);
-  }, 30_000);
-}
-
-async function tryConnectAgentWs(url: string): Promise<boolean> {
-  const wsCtor = (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
-  if (!wsCtor) {
-    return false;
-  }
-
-  return await new Promise<boolean>((resolve) => {
-    let settled = false;
-    const ws = new wsCtor(url);
-
-    const timeout = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        ws.close();
-        resolve(false);
-      }
-    }, 4000);
-
-    ws.onopen = () => {
-      clearTimeout(timeout);
-      if (settled) {
-        return;
-      }
-      settled = true;
-      process.stdout.write(`Connected to ${url}\n`);
-      ws.onmessage = (event) => {
-        process.stdout.write(`[message] ${String(event.data)}\n`);
-      };
-      resolve(true);
-    };
-
-    ws.onerror = () => {
-      clearTimeout(timeout);
-      if (settled) {
-        return;
-      }
-      settled = true;
-      resolve(false);
-    };
-
-    ws.onclose = () => {
-      clearTimeout(timeout);
-      if (!settled) {
-        settled = true;
-        resolve(false);
-      }
-    };
-  });
-}
-
 async function cmdAgentRun(): Promise<void> {
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
-  const wsUrl = toWsUrl(networkUrl);
-
-  const connected = await tryConnectAgentWs(wsUrl);
-  const timer = setupHeartbeat(
-    connected
-      ? "Agent loop active. Waiting for work..."
-      : "waiting for network WSS (Phase 1)",
+  process.stdout.write(
+    `Listening as '${config.agentName ?? "agent"}'. Polling inbox…\n`,
   );
 
+  let stopped = false;
   const cleanup = (): void => {
-    clearInterval(timer);
+    if (stopped) return;
+    stopped = true;
     process.stdout.write("Exiting agent loop.\n");
     process.exit(0);
   };
-
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
+
+  while (!stopped) {
+    const result = await fetchInbox(networkUrl);
+    if (result.kind === "error") {
+      process.stderr.write(`inbox error: ${result.message}\n`);
+    } else {
+      for (const msg of result.messages) {
+        process.stdout.write(
+          `[message] from=${msg.from} id=${msg.id}\n${msg.text}\n`,
+        );
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
 }
 
 async function cmdDiscover(args: string[]): Promise<void> {
@@ -277,16 +233,86 @@ async function cmdSend(args: string[]): Promise<void> {
   }
 
   if (result.kind === "sent") {
-    process.stdout.write(`Sent message to '${to}' (id: ${result.id}).\n`);
-    return;
-  }
-
-  if (result.kind === "stubbed") {
-    process.stdout.write(`Warning: ${result.reason}\n`);
+    process.stdout.write(
+      `Sent message to '${to}' (id: ${result.id}, status: ${result.status}).\n`,
+    );
     return;
   }
 
   printError(result.message);
+}
+
+async function cmdInbox(args: string[]): Promise<void> {
+  const json = hasFlag(args, "--json");
+  const from = valueForFlag(args, "--from");
+  const waitRaw = valueForFlag(args, "--wait");
+  const waitSeconds = waitRaw ? Number(waitRaw) : 0;
+
+  const config = await readConfig();
+  const networkUrl = getNetworkUrl(config);
+
+  if (waitSeconds > 0) {
+    const result = await waitForInbox(networkUrl, { waitSeconds, from });
+    if (result.kind === "timeout") {
+      if (json) {
+        printJson({ messages: [], timed_out: true });
+        return;
+      }
+      process.stdout.write("No messages.\n");
+      return;
+    }
+    if (result.kind === "error") {
+      printError(result.message);
+    }
+    if (json) {
+      printJson({ messages: result.messages, agent: result.agent });
+      return;
+    }
+    if (result.messages.length === 0) {
+      process.stdout.write("Inbox empty.\n");
+      return;
+    }
+    for (const msg of result.messages) {
+      process.stdout.write(`[${msg.from}] ${msg.text}\n`);
+    }
+    return;
+  }
+
+  const result = await fetchInbox(networkUrl);
+  if (result.kind === "error") {
+    printError(result.message);
+  }
+
+  const messages = from
+    ? result.messages.filter((m) => m.from.toLowerCase() === from.toLowerCase())
+    : result.messages;
+
+  if (json) {
+    printJson({ messages, agent: result.agent });
+    return;
+  }
+
+  if (messages.length === 0) {
+    process.stdout.write("Inbox empty.\n");
+    return;
+  }
+  for (const msg of messages) {
+    process.stdout.write(`[${msg.from}] ${msg.text}\n`);
+  }
+}
+
+async function cmdListen(args: string[]): Promise<void> {
+  const json = hasFlag(args, "--json");
+  const waitRaw = valueForFlag(args, "--wait");
+  const waitSeconds = waitRaw ? Number(waitRaw) : 0;
+
+  if (waitSeconds > 0) {
+    await cmdInbox(["--wait", String(waitSeconds), ...(json ? ["--json"] : [])]);
+    return;
+  }
+
+  // Continuous listen
+  await cmdAgentRun();
 }
 
 async function main(): Promise<void> {
@@ -338,6 +364,16 @@ async function main(): Promise<void> {
 
   if (args[0] === "send") {
     await cmdSend(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "inbox") {
+    await cmdInbox(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "listen") {
+    await cmdListen(args.slice(1));
     return;
   }
 
