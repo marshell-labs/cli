@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { randomUUID } from "node:crypto";
 import { getConfigPath, getNetworkUrl, patchConfig, readConfig } from "./config";
 import {
   discoverPeers,
@@ -106,12 +105,7 @@ async function cmdAgentJoin(args: string[]): Promise<void> {
   }
 
   if (result.kind === "not_found") {
-    const mockKey = `phase0-mock-${randomUUID()}`;
-    await patchConfig({ agentKey: mockKey, agentName: name });
-    process.stdout.write(
-      "Warning: join API returned 404. Saved local mock agent key (Phase 1 network join).\n",
-    );
-    return;
+    printError("Join API not found on network. Check MARSHELL_NETWORK_URL.");
   }
 
   printError(result.message);
