@@ -4,6 +4,8 @@ exports.tryFastReply = tryFastReply;
 exports.handleInbound = handleInbound;
 exports.runBridge = runBridge;
 const node_child_process_1 = require("node:child_process");
+const node_fs_1 = require("node:fs");
+const node_path_1 = require("node:path");
 const network_1 = require("./network");
 const DEFAULT_REPLY_TIMEOUT_MS = 120_000;
 const GREETING_COOLDOWN_MS = 120_000;
@@ -65,7 +67,36 @@ function tryFastReply(msg, options) {
         const body = text.slice(5).trim();
         return body || "(empty)";
     }
+    // Identity questions — answer without spawning LLM (reliable + instant).
+    if (/\bwho are you\b|\bwho're you\b|\bwhat are you\b|\band you are\??\s*$/i.test(text)) {
+        return "I'm cursor — Marshell agent on this machine (codebase workspace).";
+    }
     return null;
+}
+/** Resolve a CLI binary so Windows .cmd wrappers work under spawn(shell:false). */
+function resolveRuntimeCommand(command) {
+    if (process.platform === "win32" && command === "agent") {
+        const base = (0, node_path_1.join)(process.env.LOCALAPPDATA ?? "", "cursor-agent");
+        const versionsDir = (0, node_path_1.join)(base, "versions");
+        if ((0, node_fs_1.existsSync)(versionsDir)) {
+            const versions = (0, node_fs_1.readdirSync)(versionsDir)
+                .filter((name) => /^\d{4}\./.test(name))
+                .sort()
+                .reverse();
+            for (const version of versions) {
+                const nodePath = (0, node_path_1.join)(versionsDir, version, "node.exe");
+                const entry = (0, node_path_1.join)(versionsDir, version, "index.js");
+                if ((0, node_fs_1.existsSync)(nodePath) && (0, node_fs_1.existsSync)(entry)) {
+                    return { command: nodePath, argsPrefix: [entry] };
+                }
+            }
+        }
+        const agentCmd = (0, node_path_1.join)(base, "agent.cmd");
+        if ((0, node_fs_1.existsSync)(agentCmd)) {
+            return { command: agentCmd, argsPrefix: [] };
+        }
+    }
+    return { command, argsPrefix: [] };
 }
 function killProcessTree(pid) {
     if (!pid)
@@ -152,7 +183,9 @@ async function generateRuntimeReply(msg, runtime, workspace, timeoutMs) {
         msg.text,
     ].join("\n");
     if (runtime === "cursor") {
-        const result = await spawnCommand("agent", [
+        const resolved = resolveRuntimeCommand("agent");
+        const result = await spawnCommand(resolved.command, [
+            ...resolved.argsPrefix,
             "-p",
             "--trust",
             "--mode",
@@ -273,7 +306,13 @@ async function processReplyAsync(networkUrl, msg, options) {
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         emitEvent(options.json, { type: "error", message, in_reply_to: msg.id });
-        // Do not send failure text that peers might auto-reply to in a loop.
+        // Short failure notice so the peer is not left hanging (not a greeting/pong).
+        try {
+            await deliverReply(networkUrl, msg, `cursor runtime error: ${message}`, options.json);
+        }
+        catch {
+            // ignore secondary send failure
+        }
     }
     finally {
         state.inflight = false;

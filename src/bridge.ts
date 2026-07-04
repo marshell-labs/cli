@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import {
   ackMessages,
   fetchInbox,
@@ -100,7 +102,47 @@ export function tryFastReply(
     return body || "(empty)";
   }
 
+  // Identity questions — answer without spawning LLM (reliable + instant).
+  if (
+    /\bwho are you\b|\bwho're you\b|\bwhat are you\b|\band you are\??\s*$/i.test(
+      text,
+    )
+  ) {
+    return "I'm cursor — Marshell agent on this machine (codebase workspace).";
+  }
+
   return null;
+}
+
+/** Resolve a CLI binary so Windows .cmd wrappers work under spawn(shell:false). */
+function resolveRuntimeCommand(
+  command: "agent" | "hermes",
+): { command: string; argsPrefix: string[] } {
+  if (process.platform === "win32" && command === "agent") {
+    const base = join(
+      process.env.LOCALAPPDATA ?? "",
+      "cursor-agent",
+    );
+    const versionsDir = join(base, "versions");
+    if (existsSync(versionsDir)) {
+      const versions = readdirSync(versionsDir)
+        .filter((name) => /^\d{4}\./.test(name))
+        .sort()
+        .reverse();
+      for (const version of versions) {
+        const nodePath = join(versionsDir, version, "node.exe");
+        const entry = join(versionsDir, version, "index.js");
+        if (existsSync(nodePath) && existsSync(entry)) {
+          return { command: nodePath, argsPrefix: [entry] };
+        }
+      }
+    }
+    const agentCmd = join(base, "agent.cmd");
+    if (existsSync(agentCmd)) {
+      return { command: agentCmd, argsPrefix: [] };
+    }
+  }
+  return { command, argsPrefix: [] };
 }
 
 function killProcessTree(pid: number | undefined): void {
@@ -202,9 +244,11 @@ async function generateRuntimeReply(
   ].join("\n");
 
   if (runtime === "cursor") {
+    const resolved = resolveRuntimeCommand("agent");
     const result = await spawnCommand(
-      "agent",
+      resolved.command,
       [
+        ...resolved.argsPrefix,
         "-p",
         "--trust",
         "--mode",
@@ -357,7 +401,17 @@ async function processReplyAsync(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     emitEvent(options.json, { type: "error", message, in_reply_to: msg.id });
-    // Do not send failure text that peers might auto-reply to in a loop.
+    // Short failure notice so the peer is not left hanging (not a greeting/pong).
+    try {
+      await deliverReply(
+        networkUrl,
+        msg,
+        `cursor runtime error: ${message}`,
+        options.json,
+      );
+    } catch {
+      // ignore secondary send failure
+    }
   } finally {
     state.inflight = false;
   }
