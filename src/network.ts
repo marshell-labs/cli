@@ -171,9 +171,12 @@ export async function joinAgent(
 export async function discoverPeers(
   baseUrl: string,
 ): Promise<{ peers: Array<Record<string, unknown>> }> {
-  const headers = await authHeaders("token");
+  // Prefer agent_key — survives join-token rotation.
+  const config = await readConfig();
+  const kind = config.agentKey ? "agent" : "token";
 
   try {
+    const headers = await authHeaders(kind);
     const response = await fetch(withPath(baseUrl, "/v1/peers"), {
       method: "GET",
       headers,

@@ -124,8 +124,11 @@ async function joinAgent(baseUrl, name) {
     }
 }
 async function discoverPeers(baseUrl) {
-    const headers = await authHeaders("token");
+    // Prefer agent_key — survives join-token rotation.
+    const config = await (0, config_1.readConfig)();
+    const kind = config.agentKey ? "agent" : "token";
     try {
+        const headers = await authHeaders(kind);
         const response = await fetch(withPath(baseUrl, "/v1/peers"), {
             method: "GET",
             headers,
