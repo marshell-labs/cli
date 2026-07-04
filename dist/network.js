@@ -245,23 +245,46 @@ async function waitForInbox(baseUrl, options) {
     return { kind: "timeout" };
 }
 async function askAgent(baseUrl, to, text, waitSeconds) {
+    // Drain any stale messages from this peer before asking.
+    const stale = await fetchInbox(baseUrl, { peek: true });
+    if (stale.kind === "ok") {
+        const fromPeer = stale.messages.filter((m) => m.from.toLowerCase() === to.toLowerCase());
+        if (fromPeer.length > 0) {
+            await ackMessages(baseUrl, fromPeer.map((m) => m.id));
+        }
+    }
+    const sentAt = Date.now() - 2000;
     const sent = await sendMessage(baseUrl, to, text);
     if (sent.kind !== "sent") {
         return { kind: "error", message: sent.message };
     }
-    const inbox = await waitForInbox(baseUrl, { waitSeconds, from: to });
-    if (inbox.kind === "error") {
-        return { kind: "error", message: inbox.message };
+    const deadline = Date.now() + waitSeconds * 1000;
+    const peer = to.toLowerCase();
+    while (Date.now() < deadline) {
+        const remaining = Math.max(1, Math.min(30, Math.ceil((deadline - Date.now()) / 1000)));
+        const result = await fetchInbox(baseUrl, {
+            peek: true,
+            waitSeconds: remaining,
+        });
+        if (result.kind === "error") {
+            return { kind: "error", message: result.message };
+        }
+        const messages = result.messages.filter((m) => {
+            if (m.from.toLowerCase() !== peer)
+                return false;
+            const created = Date.parse(m.created_at);
+            return Number.isNaN(created) || created >= sentAt;
+        });
+        if (messages.length > 0) {
+            await ackMessages(baseUrl, messages.map((m) => m.id));
+            return {
+                kind: "ok",
+                reply: messages.map((m) => m.text.trim()).join("\n\n"),
+                message_id: messages[0]?.id ?? sent.id,
+            };
+        }
     }
-    if (inbox.kind === "timeout") {
-        return { kind: "timeout", sent_id: sent.id };
-    }
-    const reply = inbox.messages.map((m) => m.text.trim()).join("\n\n");
-    return {
-        kind: "ok",
-        reply,
-        message_id: inbox.messages[0]?.id ?? sent.id,
-    };
+    return { kind: "timeout", sent_id: sent.id };
 }
 function toWsUrl(httpBase) {
     const url = new URL(httpBase);
