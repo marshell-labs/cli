@@ -349,6 +349,57 @@ export async function waitForInbox(
   return { kind: "timeout" };
 }
 
+export type HistoryMessage = {
+  id: string;
+  direction: "in" | "out" | string;
+  peer: string;
+  text: string;
+  created_at: string;
+};
+
+export async function fetchHistory(
+  baseUrl: string,
+  options?: { with?: string; limit?: number },
+): Promise<
+  | { kind: "ok"; agent: string; messages: HistoryMessage[] }
+  | { kind: "error"; message: string; status?: number }
+> {
+  try {
+    const headers = await authHeaders("agent");
+    const params = new URLSearchParams();
+    if (options?.with) {
+      params.set("with", options.with);
+    }
+    if (options?.limit && options.limit > 0) {
+      params.set("limit", String(options.limit));
+    }
+    const qs = params.size > 0 ? `?${params.toString()}` : "";
+    const response = await fetch(
+      withPath(baseUrl, `/v1/messages/history${qs}`),
+      { method: "GET", headers },
+    );
+    const data = (await response.json()) as {
+      agent?: string;
+      messages?: HistoryMessage[];
+      error?: string;
+    };
+    if (!response.ok) {
+      return {
+        kind: "error",
+        status: response.status,
+        message: data.error ?? `History failed with HTTP ${response.status}.`,
+      };
+    }
+    return {
+      kind: "ok",
+      agent: data.agent ?? "",
+      messages: data.messages ?? [],
+    };
+  } catch (error) {
+    return { kind: "error", message: (error as Error).message };
+  }
+}
+
 export async function askAgent(
   baseUrl: string,
   to: string,

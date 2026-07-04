@@ -7,6 +7,7 @@ exports.sendMessage = sendMessage;
 exports.fetchInbox = fetchInbox;
 exports.ackMessages = ackMessages;
 exports.waitForInbox = waitForInbox;
+exports.fetchHistory = fetchHistory;
 exports.askAgent = askAgent;
 exports.toWsUrl = toWsUrl;
 const config_1 = require("./config");
@@ -246,6 +247,36 @@ async function waitForInbox(baseUrl, options) {
         }
     }
     return { kind: "timeout" };
+}
+async function fetchHistory(baseUrl, options) {
+    try {
+        const headers = await authHeaders("agent");
+        const params = new URLSearchParams();
+        if (options?.with) {
+            params.set("with", options.with);
+        }
+        if (options?.limit && options.limit > 0) {
+            params.set("limit", String(options.limit));
+        }
+        const qs = params.size > 0 ? `?${params.toString()}` : "";
+        const response = await fetch(withPath(baseUrl, `/v1/messages/history${qs}`), { method: "GET", headers });
+        const data = (await response.json());
+        if (!response.ok) {
+            return {
+                kind: "error",
+                status: response.status,
+                message: data.error ?? `History failed with HTTP ${response.status}.`,
+            };
+        }
+        return {
+            kind: "ok",
+            agent: data.agent ?? "",
+            messages: data.messages ?? [],
+        };
+    }
+    catch (error) {
+        return { kind: "error", message: error.message };
+    }
 }
 async function askAgent(baseUrl, to, text, waitSeconds) {
     // Drain any stale messages from this peer before asking.

@@ -20,14 +20,13 @@ function printHelp() {
         "  marshell send --to <name> --text \"...\" [--json]",
         "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
         "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
-        "  marshell listen [--json]      (alias for bridge run)",
+        "  marshell history [--with <name>] [--limit <n>] [--json]",
+        "  marshell listen [--json]      (deliver-only listener)",
         "  marshell --help",
         "",
-        "Bridge (Happy-style transport):",
-        "  Keeps a persistent listener. Delivers messages instantly.",
-        "  Fast path: ping→pong, hi→hi, echo:…→… (no LLM).",
-        "  --auto-reply spawns LLM only for non-trivial messages (async, non-blocking).",
-        "  Prefer: marshell ask --to <peer> --text \"...\" for request/response.",
+        "Middleware: send / inbox / history. Agents think; Marshell only delivers.",
+        "  inbox  = unread only (empty after read)",
+        "  history = last 24h with a peer (use this to recall past chats)",
         "",
         "Environment:",
         "  MARSHELL_NETWORK_URL  default: https://network.marshell.dev",
@@ -240,6 +239,30 @@ async function cmdAsk(args) {
     }
     printError(result.message);
 }
+async function cmdHistory(args) {
+    const json = hasFlag(args, "--json");
+    const withPeer = valueForFlag(args, "--with");
+    const limitRaw = valueForFlag(args, "--limit");
+    const limit = limitRaw ? Number(limitRaw) : 50;
+    const config = await (0, config_1.readConfig)();
+    const networkUrl = (0, config_1.getNetworkUrl)(config);
+    const result = await (0, network_1.fetchHistory)(networkUrl, { with: withPeer, limit });
+    if (result.kind === "error") {
+        printError(result.message);
+    }
+    if (json) {
+        printJson({ agent: result.agent, messages: result.messages });
+        return;
+    }
+    if (result.messages.length === 0) {
+        process.stdout.write("No messages in the last 24h.\n");
+        return;
+    }
+    for (const msg of [...result.messages].reverse()) {
+        const arrow = msg.direction === "out" ? "→" : "←";
+        process.stdout.write(`${msg.created_at} ${arrow} ${msg.peer}: ${msg.text}\n`);
+    }
+}
 async function cmdInbox(args) {
     const json = hasFlag(args, "--json");
     const from = valueForFlag(args, "--from");
@@ -360,6 +383,10 @@ async function main() {
     }
     if (args[0] === "inbox") {
         await cmdInbox(args.slice(1));
+        return;
+    }
+    if (args[0] === "history") {
+        await cmdHistory(args.slice(1));
         return;
     }
     if (args[0] === "listen") {
