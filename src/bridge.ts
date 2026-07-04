@@ -451,17 +451,7 @@ async function processReplyAsync(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     emitEvent(options.json, { type: "error", message, in_reply_to: msg.id });
-    // Short failure notice so the peer is not left hanging (not a greeting/pong).
-    try {
-      await deliverReply(
-        networkUrl,
-        msg,
-        `cursor runtime error: ${message}`,
-        options.json,
-      );
-    } catch {
-      // ignore secondary send failure
-    }
+    // Never send failure text to peers — it spams the subnet and triggers loops.
   } finally {
     state.inflight = false;
   }
