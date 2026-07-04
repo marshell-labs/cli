@@ -1,0 +1,275 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.pingNetwork = pingNetwork;
+exports.joinAgent = joinAgent;
+exports.discoverPeers = discoverPeers;
+exports.sendMessage = sendMessage;
+exports.fetchInbox = fetchInbox;
+exports.ackMessages = ackMessages;
+exports.waitForInbox = waitForInbox;
+exports.askAgent = askAgent;
+exports.toWsUrl = toWsUrl;
+const config_1 = require("./config");
+function normalizeBaseUrl(raw) {
+    return raw.endsWith("/") ? raw.slice(0, -1) : raw;
+}
+function withPath(baseUrl, path) {
+    return `${normalizeBaseUrl(baseUrl)}${path}`;
+}
+async function authHeaders(kind) {
+    const config = await (0, config_1.readConfig)();
+    const headers = {
+        "content-type": "application/json",
+    };
+    if (kind === "agent") {
+        if (!config.agentKey) {
+            throw new Error("Missing agent key. Run: marshell agent join --name <name>");
+        }
+        headers.authorization = `Bearer ${config.agentKey}`;
+    }
+    else if (config.token) {
+        headers.authorization = `Bearer ${config.token}`;
+    }
+    return headers;
+}
+async function pingNetwork(baseUrl) {
+    const candidates = ["/health", "/v1/health"];
+    for (const path of candidates) {
+        try {
+            const response = await fetch(withPath(baseUrl, path), {
+                method: "GET",
+            });
+            if (response.ok) {
+                return { ok: true, status: response.status };
+            }
+            if (response.status !== 404) {
+                return {
+                    ok: false,
+                    status: response.status,
+                    message: `Health endpoint returned HTTP ${response.status}.`,
+                };
+            }
+        }
+        catch (error) {
+            return {
+                ok: false,
+                message: error.message,
+            };
+        }
+    }
+    return {
+        ok: false,
+        message: "Health endpoint not found.",
+    };
+}
+async function postJson(url, body, headers) {
+    const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    let data = {};
+    if (text.trim().length > 0) {
+        try {
+            data = JSON.parse(text);
+        }
+        catch {
+            data = { raw: text };
+        }
+    }
+    return {
+        status: response.status,
+        data: data,
+    };
+}
+async function joinAgent(baseUrl, name) {
+    const config = await (0, config_1.readConfig)();
+    if (!config.token) {
+        return {
+            kind: "error",
+            status: 401,
+            message: "Missing auth token. Run: marshell auth set <token>",
+        };
+    }
+    try {
+        const result = await postJson(withPath(baseUrl, "/v1/agents/join"), {
+            token: config.token,
+            name,
+        }, { "content-type": "application/json" });
+        if (result.status === 404) {
+            return { kind: "not_found" };
+        }
+        if (result.status >= 200 && result.status < 300 && result.data.agent_key) {
+            return { kind: "joined", agentKey: result.data.agent_key };
+        }
+        const errText = typeof result.data === "object" &&
+            result.data &&
+            "error" in result.data &&
+            typeof result.data.error === "string"
+            ? result.data.error
+            : `Join failed with HTTP ${result.status}.`;
+        return {
+            kind: "error",
+            status: result.status,
+            message: errText,
+        };
+    }
+    catch (error) {
+        return {
+            kind: "error",
+            status: 0,
+            message: error.message,
+        };
+    }
+}
+async function discoverPeers(baseUrl) {
+    const headers = await authHeaders("token");
+    try {
+        const response = await fetch(withPath(baseUrl, "/v1/peers"), {
+            method: "GET",
+            headers,
+        });
+        if (response.ok) {
+            const data = (await response.json());
+            if (Array.isArray(data)) {
+                return { peers: data };
+            }
+            return { peers: data.peers ?? [] };
+        }
+    }
+    catch {
+        return { peers: [] };
+    }
+    return { peers: [] };
+}
+async function sendMessage(baseUrl, to, text) {
+    try {
+        const headers = await authHeaders("agent");
+        const result = await postJson(withPath(baseUrl, "/v1/messages/send"), { to, text }, headers);
+        if (result.status >= 200 && result.status < 300 && result.data.id) {
+            return {
+                kind: "sent",
+                id: result.data.id,
+                status: result.data.status ?? "delivered",
+            };
+        }
+        return {
+            kind: "error",
+            status: result.status,
+            message: result.data.error ?? `Send failed with HTTP ${result.status}.`,
+        };
+    }
+    catch (error) {
+        return {
+            kind: "error",
+            message: error.message,
+        };
+    }
+}
+async function fetchInbox(baseUrl, options) {
+    try {
+        const headers = await authHeaders("agent");
+        const params = new URLSearchParams();
+        if (options?.peek) {
+            params.set("peek", "1");
+        }
+        if (options?.waitSeconds && options.waitSeconds > 0) {
+            params.set("wait", String(Math.min(120, options.waitSeconds)));
+        }
+        const qs = params.size > 0 ? `?${params.toString()}` : "";
+        const response = await fetch(withPath(baseUrl, `/v1/messages/inbox${qs}`), {
+            method: "GET",
+            headers,
+        });
+        const data = (await response.json());
+        if (!response.ok) {
+            return {
+                kind: "error",
+                status: response.status,
+                message: data.error ?? `Inbox failed with HTTP ${response.status}.`,
+            };
+        }
+        return {
+            kind: "ok",
+            messages: data.messages ?? [],
+            agent: data.agent ?? "",
+        };
+    }
+    catch (error) {
+        return {
+            kind: "error",
+            message: error.message,
+        };
+    }
+}
+async function ackMessages(baseUrl, ids) {
+    if (ids.length === 0) {
+        return { kind: "ok", acked: 0 };
+    }
+    try {
+        const headers = await authHeaders("agent");
+        const result = await postJson(withPath(baseUrl, "/v1/messages/ack"), { ids }, headers);
+        if (result.status >= 200 && result.status < 300) {
+            return { kind: "ok", acked: result.data.acked ?? ids.length };
+        }
+        return {
+            kind: "error",
+            message: result.data.error ?? `Ack failed with HTTP ${result.status}.`,
+        };
+    }
+    catch (error) {
+        return { kind: "error", message: error.message };
+    }
+}
+async function waitForInbox(baseUrl, options) {
+    const deadline = Date.now() + options.waitSeconds * 1000;
+    const from = options.from?.toLowerCase();
+    while (Date.now() < deadline) {
+        const remaining = Math.max(1, Math.min(30, Math.ceil((deadline - Date.now()) / 1000)));
+        const result = await fetchInbox(baseUrl, {
+            peek: true,
+            waitSeconds: remaining,
+        });
+        if (result.kind === "error") {
+            return result;
+        }
+        const messages = from
+            ? result.messages.filter((m) => m.from.toLowerCase() === from)
+            : result.messages;
+        if (messages.length > 0) {
+            await ackMessages(baseUrl, messages.map((m) => m.id));
+            return { kind: "ok", messages, agent: result.agent };
+        }
+    }
+    return { kind: "timeout" };
+}
+async function askAgent(baseUrl, to, text, waitSeconds) {
+    const sent = await sendMessage(baseUrl, to, text);
+    if (sent.kind !== "sent") {
+        return { kind: "error", message: sent.message };
+    }
+    const inbox = await waitForInbox(baseUrl, { waitSeconds, from: to });
+    if (inbox.kind === "error") {
+        return { kind: "error", message: inbox.message };
+    }
+    if (inbox.kind === "timeout") {
+        return { kind: "timeout", sent_id: sent.id };
+    }
+    const reply = inbox.messages.map((m) => m.text.trim()).join("\n\n");
+    return {
+        kind: "ok",
+        reply,
+        message_id: inbox.messages[0]?.id ?? sent.id,
+    };
+}
+function toWsUrl(httpBase) {
+    const url = new URL(httpBase);
+    if (url.protocol === "https:") {
+        url.protocol = "wss:";
+    }
+    else {
+        url.protocol = "ws:";
+    }
+    return `${url.toString().replace(/\/$/, "")}/v1/agents/ws`;
+}
