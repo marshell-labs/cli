@@ -1,39 +1,49 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
 import { hostname } from "node:os";
+import { runBridge, type BridgeOptions } from "./bridge";
 import { getConfigPath, getNetworkUrl, patchConfig, readConfig } from "./config";
 import {
   ackMessages,
+  askAgent,
   discoverPeers,
   fetchInbox,
   joinAgent,
   pingNetwork,
   sendMessage,
   waitForInbox,
-  type InboxMessage,
 } from "./network";
 
 type JsonShape = Record<string, unknown>;
 
 function printHelp(): void {
   const message = [
-    "marshell - Phase 0 CLI",
+    "marshell - agent messaging bridge",
     "",
     "Usage:",
     "  marshell auth set <token> [--name <name>]",
     "  marshell auth status [--json]",
     "  marshell agent join --name <name>",
-    "  marshell agent run [--auto-reply] [--workspace <path>] [--runtime cursor|hermes]",
+    "  marshell bridge run [--json] [--hook <cmd>]",
+    "  marshell bridge run --auto-reply [--runtime cursor|hermes|fast] [--workspace <path>]",
+    "  marshell agent run            (alias for bridge run)",
     "  marshell discover [--json]",
     "  marshell send --to <name> --text \"...\" [--json]",
+    "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
     "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
-    "  marshell listen [--json] [--wait <seconds>] [--auto-reply]",
+    "  marshell listen [--json]      (alias for bridge run)",
     "  marshell --help",
+    "",
+    "Bridge (Happy-style transport):",
+    "  Keeps a persistent listener. Delivers messages instantly.",
+    "  Fast path: ping→pong, hi→hi, echo:…→… (no LLM).",
+    "  --auto-reply spawns LLM only for non-trivial messages (async, non-blocking).",
+    "  Prefer: marshell ask --to <peer> --text \"...\" for request/response.",
     "",
     "Environment:",
     "  MARSHELL_NETWORK_URL  default: https://network.marshell.dev",
     "  MARSHELL_AGENT_NAME   default agent name for auth set",
-    "  MARSHELL_WORKSPACE    workspace for --auto-reply (cursor runtime)",
+    "  MARSHELL_WORKSPACE    workspace for cursor auto-reply",
+    "  MARSHELL_HOOK         default hook command for bridge",
     "  MARSHELL_CONFIG       optional path to config file",
   ].join("\n");
   process.stdout.write(`${message}\n`);
@@ -80,6 +90,40 @@ function valueForFlag(args: string[], flag: string): string | undefined {
   return args[index + 1];
 }
 
+function bridgeOptionsFromArgs(args: string[]): BridgeOptions {
+  const configPromise = readConfig();
+  // sync read not available — caller must await
+  void configPromise;
+  const autoReply = hasFlag(args, "--auto-reply");
+  const json = hasFlag(args, "--json");
+  const workspace =
+    valueForFlag(args, "--workspace") ??
+    process.env.MARSHELL_WORKSPACE ??
+    process.cwd();
+  const hook = valueForFlag(args, "--hook") ?? process.env.MARSHELL_HOOK;
+  const runtimeFlag = valueForFlag(args, "--runtime");
+  const runtime: BridgeOptions["runtime"] =
+    runtimeFlag === "hermes" || runtimeFlag === "cursor" || runtimeFlag === "fast"
+      ? runtimeFlag
+      : process.platform === "win32"
+        ? "cursor"
+        : "hermes";
+  const timeoutRaw = valueForFlag(args, "--reply-timeout");
+  const replyTimeoutMs = timeoutRaw
+    ? Math.max(5, Number(timeoutRaw)) * 1000
+    : 120_000;
+
+  return {
+    networkUrl: "",
+    autoReply,
+    runtime,
+    workspace,
+    hook,
+    json,
+    replyTimeoutMs,
+  };
+}
+
 async function cmdAuthSet(args: string[]): Promise<void> {
   const named = valueForFlag(args, "--name");
   const tokenArg = args.filter((a, i) => {
@@ -123,6 +167,7 @@ async function cmdAuthStatus(args: string[]): Promise<void> {
   const payload: JsonShape = {
     hasToken: Boolean(config.token),
     hasAgentKey: Boolean(config.agentKey),
+    agentName: config.agentName ?? null,
     networkUrl,
     health,
   };
@@ -164,224 +209,34 @@ async function cmdAgentJoin(args: string[]): Promise<void> {
   printError(result.message);
 }
 
-const AUTO_REPLY_TIMEOUT_MS = 45_000;
-
-function killProcessTree(pid: number | undefined): void {
-  if (!pid) return;
-  if (process.platform === "win32") {
-    spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-    return;
-  }
-  try {
-    process.kill(-pid, "SIGKILL");
-  } catch {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // ignore
-    }
-  }
-}
-
-function runCommandCapture(
-  command: string,
-  args: string[],
-  options?: { cwd?: string; timeoutMs?: number },
-): Promise<{ code: number; stdout: string; stderr: string }> {
-  const timeoutMs = options?.timeoutMs ?? AUTO_REPLY_TIMEOUT_MS;
-  return new Promise((resolve) => {
-    const child = spawn(command, args, {
-      cwd: options?.cwd,
-      env: process.env,
-      shell: process.platform === "win32",
-      detached: process.platform !== "win32",
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const finish = (code: number, errText?: string) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({
-        code,
-        stdout,
-        stderr: errText ? `${stderr}\n${errText}`.trim() : stderr,
-      });
-    };
-    const timer = setTimeout(() => {
-      killProcessTree(child.pid);
-      finish(124, `timeout after ${Math.round(timeoutMs / 1000)}s`);
-    }, timeoutMs);
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    child.on("close", (code) => {
-      finish(code ?? 1);
-    });
-    child.on("error", (error) => {
-      finish(1, error.message);
-    });
-  });
-}
-
-async function generateAutoReply(
-  msg: InboxMessage,
-  runtime: "cursor" | "hermes",
-  workspace: string,
-): Promise<string> {
-  const prompt = [
-    `Another Marshell agent named "${msg.from}" sent you this request.`,
-    "Answer it using the local workspace/codebase.",
-    "Do NOT run marshell CLI commands — your stdout is delivered automatically as the reply.",
-    "Do NOT mention Ask mode, Agent mode, tools, or that you are an AI.",
-    "Reply with ONLY the answer text. No preamble.",
-    "",
-    "Request:",
-    msg.text,
-  ].join("\n");
-
-  if (runtime === "cursor") {
-    // ask mode is read-only and much faster than full agent --force
-    const result = await runCommandCapture("agent", [
-      "-p",
-      "--trust",
-      "--mode",
-      "ask",
-      "--workspace",
-      workspace,
-      "--output-format",
-      "text",
-      prompt,
-    ]);
-    if (result.code === 124) {
-      throw new Error("auto-reply timed out (45s)");
-    }
-    if (result.code !== 0) {
-      throw new Error(result.stderr || result.stdout || "cursor agent failed");
-    }
-    return result.stdout.trim();
-  }
-
-  const result = await runCommandCapture("hermes", ["-z", prompt]);
-  if (result.code === 124) {
-    throw new Error("auto-reply timed out (45s)");
-  }
-  if (result.code !== 0) {
-    throw new Error(result.stderr || result.stdout || "hermes failed");
-  }
-  return result.stdout.trim();
-}
-
-async function handleInboundMessage(
-  networkUrl: string,
-  msg: InboxMessage,
-  autoReply: boolean,
-  runtime: "cursor" | "hermes",
-  workspace: string,
-): Promise<void> {
-  process.stdout.write(`[message] from=${msg.from} id=${msg.id}\n${msg.text}\n`);
-
-  if (!autoReply) {
-    await ackMessages(networkUrl, [msg.id]);
-    return;
-  }
-
-  try {
-    process.stdout.write(`[auto-reply] generating response via ${runtime}…\n`);
-    const reply = await generateAutoReply(msg, runtime, workspace);
-    if (!reply) {
-      throw new Error("empty reply from runtime");
-    }
-    const sent = await sendMessage(networkUrl, msg.from, reply);
-    if (sent.kind !== "sent") {
-      throw new Error(sent.message);
-    }
-    process.stdout.write(
-      `[auto-reply] sent to ${msg.from} (id: ${sent.id})\n`,
-    );
-    await ackMessages(networkUrl, [msg.id]);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`[auto-reply] failed: ${message}\n`);
-    // leave message in inbox for retry
-  }
-}
-
-async function cmdAgentRun(args: string[] = []): Promise<void> {
-  const autoReply = hasFlag(args, "--auto-reply");
-  const workspace =
-    valueForFlag(args, "--workspace") ??
-    process.env.MARSHELL_WORKSPACE ??
-    process.cwd();
-  const runtimeFlag = valueForFlag(args, "--runtime");
-  const runtime: "cursor" | "hermes" =
-    runtimeFlag === "hermes" || runtimeFlag === "cursor"
-      ? runtimeFlag
-      : process.platform === "win32"
-        ? "cursor"
-        : "hermes";
-
+async function cmdBridgeRun(args: string[] = []): Promise<void> {
   const config = await readConfig();
-  const networkUrl = getNetworkUrl(config);
-  process.stdout.write(
-    `Listening as '${config.agentName ?? "agent"}'${autoReply ? ` (auto-reply via ${runtime})` : ""}.\n`,
-  );
-
-  let stopped = false;
-  const cleanup = (): void => {
-    if (stopped) return;
-    stopped = true;
-    process.stdout.write("Exiting agent loop.\n");
-    process.exit(0);
-  };
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
-
-  while (!stopped) {
-    const result = await fetchInbox(networkUrl, { peek: true });
-    if (result.kind === "error") {
-      process.stderr.write(`inbox error: ${result.message}\n`);
-    } else {
-      for (const msg of result.messages) {
-        await handleInboundMessage(
-          networkUrl,
-          msg,
-          autoReply,
-          runtime,
-          workspace,
-        );
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-  }
+  const opts = bridgeOptionsFromArgs(args);
+  opts.networkUrl = getNetworkUrl(config);
+  opts.agentName = config.agentName;
+  await runBridge(opts);
 }
 
 async function cmdDiscover(args: string[]): Promise<void> {
   const json = hasFlag(args, "--json");
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
-  const discovered = await discoverPeers(networkUrl);
+  const { peers } = await discoverPeers(networkUrl);
 
   if (json) {
-    printJson({ peers: discovered.peers });
+    printJson({ peers });
     return;
   }
 
-  if (discovered.peers.length === 0) {
-    process.stdout.write("No peers discovered.\n");
+  if (peers.length === 0) {
+    process.stdout.write("No peers found.\n");
     return;
   }
 
-  process.stdout.write(`Discovered ${discovered.peers.length} peer(s):\n`);
-  for (const peer of discovered.peers) {
-    process.stdout.write(`- ${JSON.stringify(peer)}\n`);
+  for (const peer of peers) {
+    const name = typeof peer.name === "string" ? peer.name : "?";
+    const status = typeof peer.status === "string" ? peer.status : "unknown";
+    process.stdout.write(`- ${name} (${status})\n`);
   }
 }
 
@@ -410,6 +265,40 @@ async function cmdSend(args: string[]): Promise<void> {
     return;
   }
 
+  printError(result.message);
+}
+
+async function cmdAsk(args: string[]): Promise<void> {
+  const json = hasFlag(args, "--json");
+  const to = valueForFlag(args, "--to");
+  const text = valueForFlag(args, "--text");
+  const waitRaw = valueForFlag(args, "--wait");
+  const waitSeconds = waitRaw ? Number(waitRaw) : 120;
+
+  if (!to || !text) {
+    printError(
+      "Usage: marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
+    );
+  }
+
+  const config = await readConfig();
+  const networkUrl = getNetworkUrl(config);
+  const result = await askAgent(networkUrl, to, text, waitSeconds);
+
+  if (json) {
+    printJson(result as unknown as JsonShape);
+    return;
+  }
+
+  if (result.kind === "ok") {
+    process.stdout.write(`${result.reply}\n`);
+    return;
+  }
+  if (result.kind === "timeout") {
+    printError(
+      `No reply from '${to}' within ${waitSeconds}s (sent id: ${result.sent_id}). Is their bridge running?`,
+    );
+  }
   printError(result.message);
 }
 
@@ -458,6 +347,13 @@ async function cmdInbox(args: string[]): Promise<void> {
     ? result.messages.filter((m) => m.from.toLowerCase() === from.toLowerCase())
     : result.messages;
 
+  if (messages.length > 0) {
+    await ackMessages(
+      networkUrl,
+      messages.map((m) => m.id),
+    );
+  }
+
   if (json) {
     printJson({ messages, agent: result.agent });
     return;
@@ -473,16 +369,16 @@ async function cmdInbox(args: string[]): Promise<void> {
 }
 
 async function cmdListen(args: string[]): Promise<void> {
-  const json = hasFlag(args, "--json");
   const waitRaw = valueForFlag(args, "--wait");
   const waitSeconds = waitRaw ? Number(waitRaw) : 0;
+  const json = hasFlag(args, "--json");
 
   if (waitSeconds > 0) {
     await cmdInbox(["--wait", String(waitSeconds), ...(json ? ["--json"] : [])]);
     return;
   }
 
-  await cmdAgentRun(args);
+  await cmdBridgeRun(args);
 }
 
 async function main(): Promise<void> {
@@ -520,11 +416,23 @@ async function main(): Promise<void> {
     }
 
     if (sub === "run") {
-      await cmdAgentRun(rest);
+      await cmdBridgeRun(rest);
       return;
     }
 
     printError("Unknown agent command. Try: marshell agent join|run");
+  }
+
+  if (args[0] === "bridge") {
+    const sub = args[1];
+    const rest = args.slice(2);
+
+    if (sub === "run") {
+      await cmdBridgeRun(rest);
+      return;
+    }
+
+    printError("Unknown bridge command. Try: marshell bridge run");
   }
 
   if (args[0] === "discover") {
@@ -534,6 +442,11 @@ async function main(): Promise<void> {
 
   if (args[0] === "send") {
     await cmdSend(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "ask") {
+    await cmdAsk(args.slice(1));
     return;
   }
 

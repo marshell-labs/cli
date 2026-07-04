@@ -234,14 +234,21 @@ export async function sendMessage(
 
 export async function fetchInbox(
   baseUrl: string,
-  options?: { peek?: boolean },
+  options?: { peek?: boolean; waitSeconds?: number },
 ): Promise<
   | { kind: "ok"; messages: InboxMessage[]; agent: string }
   | { kind: "error"; message: string; status?: number }
 > {
   try {
     const headers = await authHeaders("agent");
-    const qs = options?.peek ? "?peek=1" : "";
+    const params = new URLSearchParams();
+    if (options?.peek) {
+      params.set("peek", "1");
+    }
+    if (options?.waitSeconds && options.waitSeconds > 0) {
+      params.set("wait", String(Math.min(120, options.waitSeconds)));
+    }
+    const qs = params.size > 0 ? `?${params.toString()}` : "";
     const response = await fetch(withPath(baseUrl, `/v1/messages/inbox${qs}`), {
       method: "GET",
       headers,
@@ -311,7 +318,14 @@ export async function waitForInbox(
   const from = options.from?.toLowerCase();
 
   while (Date.now() < deadline) {
-    const result = await fetchInbox(baseUrl, { peek: true });
+    const remaining = Math.max(
+      1,
+      Math.min(30, Math.ceil((deadline - Date.now()) / 1000)),
+    );
+    const result = await fetchInbox(baseUrl, {
+      peek: true,
+      waitSeconds: remaining,
+    });
     if (result.kind === "error") {
       return result;
     }
@@ -327,11 +341,40 @@ export async function waitForInbox(
       );
       return { kind: "ok", messages, agent: result.agent };
     }
-
-    await new Promise((resolve) => setTimeout(resolve, 1500));
   }
 
   return { kind: "timeout" };
+}
+
+export async function askAgent(
+  baseUrl: string,
+  to: string,
+  text: string,
+  waitSeconds: number,
+): Promise<
+  | { kind: "ok"; reply: string; message_id: string }
+  | { kind: "timeout"; sent_id: string }
+  | { kind: "error"; message: string }
+> {
+  const sent = await sendMessage(baseUrl, to, text);
+  if (sent.kind !== "sent") {
+    return { kind: "error", message: sent.message };
+  }
+
+  const inbox = await waitForInbox(baseUrl, { waitSeconds, from: to });
+  if (inbox.kind === "error") {
+    return { kind: "error", message: inbox.message };
+  }
+  if (inbox.kind === "timeout") {
+    return { kind: "timeout", sent_id: sent.id };
+  }
+
+  const reply = inbox.messages.map((m) => m.text.trim()).join("\n\n");
+  return {
+    kind: "ok",
+    reply,
+    message_id: inbox.messages[0]?.id ?? sent.id,
+  };
 }
 
 export function toWsUrl(httpBase: string): string {
