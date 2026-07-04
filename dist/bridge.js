@@ -30,10 +30,54 @@ function isEcho(peer, text) {
     const normalized = text.trim().toLowerCase();
     const state = peerState(peer);
     const now = Date.now();
-    return state.recentOutbound.some((item) => item.text === normalized && now - item.at < ECHO_WINDOW_MS);
+    return state.recentOutbound.some((item) => {
+        if (now - item.at >= ECHO_WINDOW_MS)
+            return false;
+        if (item.text === normalized)
+            return true;
+        // Peer quoting/acking our last reply ("got it — acknowledged").
+        if (normalized.includes(item.text) || item.text.includes(normalized)) {
+            return item.text.length >= 4 && normalized.length <= item.text.length + 40;
+        }
+        return false;
+    });
 }
 function isGreeting(text) {
     return /^(hi|hello|hey|yo|sup|picun)[!.?\s]*$/i.test(text.trim());
+}
+/** Short acks / reactions — deliver only, never auto-reply (stops chat spam). */
+function isAckOnly(text) {
+    const t = text.trim();
+    if (!t)
+        return true;
+    if (/^[\p{Emoji_Presentation}\p{Extended_Pictographic}\s\p{P}]+$/u.test(t)) {
+        return true;
+    }
+    if (/^(got it|ok|okay|k|kk|thanks|thank you|thx|ty|cool|nice|great|ack|acknowledged|roger|copy|noted|np|no problem|sounds good|sg|lgtm|sure|yep|yeah|yes|no|nah|👍|✅)[.!*]*$/i.test(t)) {
+        return true;
+    }
+    // Very short non-questions are almost always reactions.
+    if (t.length <= 16 && !/[?]/.test(t) && !/\bwho\b|\bwhat\b|\bhow\b/i.test(t)) {
+        return true;
+    }
+    return false;
+}
+/** Only spend LLM budget on real questions / tasks. */
+function needsReply(text) {
+    const t = text.trim();
+    if (!t || isGreeting(t) || isAckOnly(t) || /^pong$/i.test(t)) {
+        return false;
+    }
+    if (/[?]/.test(t))
+        return true;
+    if (/\b(who are you|who're you|what are you|and you are)\b/i.test(t)) {
+        return true;
+    }
+    if (/^(who|what|where|when|why|how|can|could|would|please|tell|ask|explain|list|show|find|read|check|run|write|fix|deploy|summarize)\b/i.test(t)) {
+        return true;
+    }
+    // Longer messages are likely real tasks.
+    return t.length >= 48;
 }
 /**
  * Instant replies — no LLM. Never reply in a way that loops with another bridge.
@@ -343,12 +387,12 @@ async function handleInbound(networkUrl, msg, options) {
         await deliverReply(networkUrl, msg, fast, options.json);
         return;
     }
-    // Trivial greetings already handled or on cooldown — do not burn LLM.
-    if (isGreeting(msg.text) || /^pong$/i.test(msg.text.trim())) {
+    // Greetings / acks / reactions: deliver only, no reply spam.
+    if (!needsReply(msg.text)) {
         emitEvent(options.json, {
             type: "skip",
             from: msg.from,
-            reason: "trivial/cooldown",
+            reason: "no-reply (ack/greeting/trivial)",
             id: msg.id,
         });
         return;
