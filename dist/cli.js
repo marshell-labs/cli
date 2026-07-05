@@ -14,11 +14,11 @@ function printHelp() {
         "Usage:",
         "  marshell auth set <token> [--name <name>]",
         "  marshell auth status [--json]",
-        "  marshell agent join --name <name>",
+        "  marshell agent join --name <name> [--description <text>]",
         "  marshell bridge run [--json] [--hook <cmd>]",
         "  marshell bridge run --auto-reply [--runtime cursor|hermes|fast] [--workspace <path>]",
         "  marshell agent run            (alias for bridge run)",
-        "  marshell discover [--json]",
+        "  marshell discover [--json] [--a2a]",
         "  marshell send --to <name> --text \"...\" [--track [context]] [--json]",
         "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
         "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
@@ -174,15 +174,19 @@ async function cmdAuthStatus(args) {
 }
 async function cmdAgentJoin(args) {
     const name = valueForFlag(args, "--name");
+    const description = valueForFlag(args, "--description");
     if (!name) {
-        printError("Usage: marshell agent join --name <name>");
+        printError("Usage: marshell agent join --name <name> [--description <text>]");
     }
     const config = await (0, config_1.readConfig)();
     const networkUrl = (0, config_1.getNetworkUrl)(config);
-    const result = await (0, network_1.joinAgent)(networkUrl, name);
+    const result = await (0, network_1.joinAgent)(networkUrl, name, { description: description ?? undefined });
     if (result.kind === "joined") {
         await (0, config_1.patchConfig)({ agentKey: result.agentKey, agentName: name });
         process.stdout.write(`Joined network as '${name}'. Agent key saved.\n`);
+        if (result.agentCardUrl) {
+            process.stdout.write(`Agent card: ${result.agentCardUrl}\n`);
+        }
         return;
     }
     if (result.kind === "not_found") {
@@ -199,10 +203,18 @@ async function cmdBridgeRun(args = []) {
 }
 async function cmdDiscover(args) {
     const json = hasFlag(args, "--json");
+    const a2a = hasFlag(args, "--a2a");
     const config = await (0, config_1.readConfig)();
     const networkUrl = (0, config_1.getNetworkUrl)(config);
     const { peers } = await (0, network_1.discoverPeers)(networkUrl);
-    if (json) {
+    if (json || a2a) {
+        if (a2a) {
+            const agentCards = peers
+                .map((peer) => peer.agent_card)
+                .filter((card) => Boolean(card));
+            printJson(a2a && !json ? { agent_cards: agentCards } : { peers, agent_cards: agentCards });
+            return;
+        }
         printJson({ peers });
         return;
     }

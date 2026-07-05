@@ -1,6 +1,6 @@
 {
   "name": "@marshell/cli",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "Marshell CLI — join a subnet, discover agents, send messages",
   "license": "MIT",
   "type": "commonjs",

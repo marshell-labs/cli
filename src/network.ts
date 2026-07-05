@@ -8,6 +8,14 @@ export type HealthStatus = {
 
 export type JoinResponse = {
   agent_key: string;
+  agent_card_url?: string;
+};
+
+export const MARSHELL_CLI_VERSION = "0.7.5";
+
+export type JoinAgentOptions = {
+  description?: string;
+  version?: string;
 };
 
 export type InboxMessage = {
@@ -114,8 +122,9 @@ async function postJson<T>(
 export async function joinAgent(
   baseUrl: string,
   name: string,
+  options: JoinAgentOptions = {},
 ): Promise<
-  | { kind: "joined"; agentKey: string }
+  | { kind: "joined"; agentKey: string; agentCardUrl?: string }
   | { kind: "not_found" }
   | { kind: "error"; status: number; message: string }
 > {
@@ -134,6 +143,8 @@ export async function joinAgent(
       {
         token: config.token,
         name,
+        description: options.description?.trim() || undefined,
+        version: options.version ?? MARSHELL_CLI_VERSION,
       },
       { "content-type": "application/json" },
     );
@@ -143,7 +154,11 @@ export async function joinAgent(
     }
 
     if (result.status >= 200 && result.status < 300 && result.data.agent_key) {
-      return { kind: "joined", agentKey: result.data.agent_key };
+      return {
+        kind: "joined",
+        agentKey: result.data.agent_key,
+        agentCardUrl: result.data.agent_card_url,
+      };
     }
 
     const errText =

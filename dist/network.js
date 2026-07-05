@@ -1,5 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.MARSHELL_CLI_VERSION = void 0;
 exports.pingNetwork = pingNetwork;
 exports.joinAgent = joinAgent;
 exports.discoverPeers = discoverPeers;
@@ -11,6 +12,7 @@ exports.fetchHistory = fetchHistory;
 exports.askAgent = askAgent;
 exports.toWsUrl = toWsUrl;
 const config_1 = require("./config");
+exports.MARSHELL_CLI_VERSION = "0.7.5";
 function normalizeBaseUrl(raw) {
     return raw.endsWith("/") ? raw.slice(0, -1) : raw;
 }
@@ -84,7 +86,7 @@ async function postJson(url, body, headers) {
         data: data,
     };
 }
-async function joinAgent(baseUrl, name) {
+async function joinAgent(baseUrl, name, options = {}) {
     const config = await (0, config_1.readConfig)();
     if (!config.token) {
         return {
@@ -97,12 +99,18 @@ async function joinAgent(baseUrl, name) {
         const result = await postJson(withPath(baseUrl, "/v1/agents/join"), {
             token: config.token,
             name,
+            description: options.description?.trim() || undefined,
+            version: options.version ?? exports.MARSHELL_CLI_VERSION,
         }, { "content-type": "application/json" });
         if (result.status === 404) {
             return { kind: "not_found" };
         }
         if (result.status >= 200 && result.status < 300 && result.data.agent_key) {
-            return { kind: "joined", agentKey: result.data.agent_key };
+            return {
+                kind: "joined",
+                agentKey: result.data.agent_key,
+                agentCardUrl: result.data.agent_card_url,
+            };
         }
         const errText = typeof result.data === "object" &&
             result.data &&

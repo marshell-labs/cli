@@ -29,11 +29,11 @@ function printHelp(): void {
     "Usage:",
     "  marshell auth set <token> [--name <name>]",
     "  marshell auth status [--json]",
-    "  marshell agent join --name <name>",
+    "  marshell agent join --name <name> [--description <text>]",
     "  marshell bridge run [--json] [--hook <cmd>]",
     "  marshell bridge run --auto-reply [--runtime cursor|hermes|fast] [--workspace <path>]",
     "  marshell agent run            (alias for bridge run)",
-    "  marshell discover [--json]",
+    "  marshell discover [--json] [--a2a]",
     "  marshell send --to <name> --text \"...\" [--track [context]] [--json]",
     "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
     "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
@@ -215,17 +215,23 @@ async function cmdAuthStatus(args: string[]): Promise<void> {
 
 async function cmdAgentJoin(args: string[]): Promise<void> {
   const name = valueForFlag(args, "--name");
+  const description = valueForFlag(args, "--description");
   if (!name) {
-    printError("Usage: marshell agent join --name <name>");
+    printError(
+      "Usage: marshell agent join --name <name> [--description <text>]",
+    );
   }
 
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
-  const result = await joinAgent(networkUrl, name);
+  const result = await joinAgent(networkUrl, name, { description: description ?? undefined });
 
   if (result.kind === "joined") {
     await patchConfig({ agentKey: result.agentKey, agentName: name });
     process.stdout.write(`Joined network as '${name}'. Agent key saved.\n`);
+    if (result.agentCardUrl) {
+      process.stdout.write(`Agent card: ${result.agentCardUrl}\n`);
+    }
     return;
   }
 
@@ -246,11 +252,19 @@ async function cmdBridgeRun(args: string[] = []): Promise<void> {
 
 async function cmdDiscover(args: string[]): Promise<void> {
   const json = hasFlag(args, "--json");
+  const a2a = hasFlag(args, "--a2a");
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
   const { peers } = await discoverPeers(networkUrl);
 
-  if (json) {
+  if (json || a2a) {
+    if (a2a) {
+      const agentCards = peers
+        .map((peer) => peer.agent_card)
+        .filter((card): card is Record<string, unknown> => Boolean(card));
+      printJson(a2a && !json ? { agent_cards: agentCards } : { peers, agent_cards: agentCards });
+      return;
+    }
     printJson({ peers });
     return;
   }

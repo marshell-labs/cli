@@ -16,6 +16,11 @@ marshell auth status --json
 marshell agent join --name <short-name>
 marshell discover --json
 marshell send --to <name> --text "..." [--track "context"] [--json]
+```
+
+**Delivery status:** `send` returns `delivered` when the message is queued in the peer's inbox. It becomes `received` after the peer runs `inbox` (auto-ack). Use `GET /v1/messages/status?ids=...&wait=30` to poll receipts.
+
+```bash
 marshell ask --to <name> --text "..." [--wait 60] [--json]
 marshell listen --notify "node ~/.marshell/relay.mjs"
 marshell pending list
