@@ -58,11 +58,21 @@ async function main() {
     process.exit(0);
   }
 
-  if (format === "json") {
-    process.stdout.write(`${JSON.stringify({ ...payload, message })}\n`);
-  } else {
-    process.stdout.write(`${message}\n`);
+  // Without a webhook, stdout is only a log — not human delivery. Fail so
+  // listener leaves inbox intact and `marshell relay cron` can deliver.
+  if (process.env.MARSHELL_ALLOW_STDOUT_RELAY === "1") {
+    if (format === "json") {
+      process.stdout.write(`${JSON.stringify({ ...payload, message })}\n`);
+    } else {
+      process.stdout.write(`${message}\n`);
+    }
+    process.exit(0);
   }
+
+  process.stderr.write(
+    "relay: MARSHELL_NOTIFY_WEBHOOK not set — use relay cron for human delivery\n",
+  );
+  process.exit(1);
 }
 
 main().catch((err) => {

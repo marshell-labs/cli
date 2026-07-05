@@ -522,7 +522,7 @@ export async function handleInbound(
     pending: pending ?? undefined,
   });
 
-  // Push to human channel (Telegram, webhook, etc.) — side effect only.
+  // Push to human channel. On failure, leave message in inbox for `relay cron`.
   if (options.notify && !isEcho(msg.from, msg.text)) {
     try {
       await runNotifyCommand(options.notify, msg, pending);
@@ -543,10 +543,11 @@ export async function handleInbound(
         message: `notify: ${message}`,
         in_reply_to: msg.id,
       });
+      // Do not ack — cron will retry delivery to the human.
+      return;
     }
   }
 
-  // Always ack so backlog never sticks.
   await ackMessages(networkUrl, [msg.id]);
 
   // Drop echoes of our own recent outbound (hi↔hi loops).

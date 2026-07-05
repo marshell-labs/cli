@@ -477,23 +477,19 @@ async function cmdRelay(args: string[]): Promise<void> {
     return;
   }
 
-  if (result.message && result.relayed.length === 0) {
-    process.stdout.write(`${result.message}\n`);
+  if (result.relayed.length > 0) {
+    if (result.pending_count === 0 && !pendingOnly) {
+      process.stdout.write(
+        `${result.relayed.length} new inbound message(s):\n\n`,
+      );
+    }
+    process.stdout.write(`${formatRelayOutput(result.relayed)}\n`);
     return;
   }
 
-  if (result.relayed.length === 0) {
-    process.stdout.write("Nothing new to relay.\n");
-    return;
-  }
-
-  if (result.pending_count === 0 && !pendingOnly) {
-    process.stdout.write(
-      `${result.relayed.length} new inbound message(s):\n\n`,
-    );
-  }
-
-  process.stdout.write(`${formatRelayOutput(result.relayed)}\n`);
+  process.stdout.write(
+    result.message ?? "Nothing new to relay.\n",
+  );
 }
 
 async function cmdPending(args: string[]): Promise<void> {

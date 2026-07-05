@@ -384,18 +384,14 @@ async function cmdRelay(args) {
         });
         return;
     }
-    if (result.message && result.relayed.length === 0) {
-        process.stdout.write(`${result.message}\n`);
+    if (result.relayed.length > 0) {
+        if (result.pending_count === 0 && !pendingOnly) {
+            process.stdout.write(`${result.relayed.length} new inbound message(s):\n\n`);
+        }
+        process.stdout.write(`${(0, relay_cron_1.formatRelayOutput)(result.relayed)}\n`);
         return;
     }
-    if (result.relayed.length === 0) {
-        process.stdout.write("Nothing new to relay.\n");
-        return;
-    }
-    if (result.pending_count === 0 && !pendingOnly) {
-        process.stdout.write(`${result.relayed.length} new inbound message(s):\n\n`);
-    }
-    process.stdout.write(`${(0, relay_cron_1.formatRelayOutput)(result.relayed)}\n`);
+    process.stdout.write(result.message ?? "Nothing new to relay.\n");
 }
 async function cmdPending(args) {
     const json = hasFlag(args, "--json");
