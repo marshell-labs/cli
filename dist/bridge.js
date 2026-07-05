@@ -8,6 +8,7 @@ const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const network_1 = require("./network");
 const pending_1 = require("./pending");
+const relay_state_1 = require("./relay-state");
 const DEFAULT_REPLY_TIMEOUT_MS = 120_000;
 const GREETING_COOLDOWN_MS = 120_000;
 const ECHO_WINDOW_MS = 60_000;
@@ -408,6 +409,7 @@ async function handleInbound(networkUrl, msg, options) {
             if (pending) {
                 await (0, pending_1.clearPending)(msg.from);
             }
+            await (0, relay_state_1.markRelayed)([msg.id]);
         }
         catch (error) {
             const message = error instanceof Error ? error.message : String(error);

@@ -13,6 +13,7 @@ import {
   matchPending,
   type PendingEntry,
 } from "./pending";
+import { markRelayed } from "./relay-state";
 
 export type BridgeOptions = {
   networkUrl: string;
@@ -534,6 +535,7 @@ export async function handleInbound(
       if (pending) {
         await clearPending(msg.from);
       }
+      await markRelayed([msg.id]);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       emitEvent(options.json, {

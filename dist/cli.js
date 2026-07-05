@@ -6,6 +6,7 @@ const bridge_1 = require("./bridge");
 const config_1 = require("./config");
 const network_1 = require("./network");
 const pending_1 = require("./pending");
+const relay_cron_1 = require("./relay-cron");
 function printHelp() {
     const message = [
         "marshell - agent messaging bridge",
@@ -23,6 +24,7 @@ function printHelp() {
         "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
         "  marshell history [--with <name>] [--limit <n>] [--json]",
         "  marshell listen [--json] [--notify <cmd>]  (deliver-only listener)",
+        "  marshell relay cron [--include-untracked] [--json]",
         "  marshell pending list|clear [--peer <name>] [--json]",
         "  marshell --help",
         "",
@@ -365,6 +367,36 @@ async function cmdInbox(args) {
         process.stdout.write(`[${msg.from}] ${msg.text}\n`);
     }
 }
+async function cmdRelay(args) {
+    const sub = args[0];
+    if (sub !== "cron") {
+        printError("Usage: marshell relay cron [--include-untracked] [--json]");
+    }
+    const json = hasFlag(args, "--json");
+    const pendingOnly = !hasFlag(args, "--include-untracked");
+    const config = await (0, config_1.readConfig)();
+    const networkUrl = (0, config_1.getNetworkUrl)(config);
+    const result = await (0, relay_cron_1.runRelayCron)({ networkUrl, pendingOnly });
+    if (json) {
+        printJson({
+            ...result,
+            formatted: (0, relay_cron_1.formatRelayOutput)(result.relayed),
+        });
+        return;
+    }
+    if (result.message && result.relayed.length === 0) {
+        process.stdout.write(`${result.message}\n`);
+        return;
+    }
+    if (result.relayed.length === 0) {
+        process.stdout.write("Nothing new to relay.\n");
+        return;
+    }
+    if (result.pending_count === 0 && !pendingOnly) {
+        process.stdout.write(`${result.relayed.length} new inbound message(s):\n\n`);
+    }
+    process.stdout.write(`${(0, relay_cron_1.formatRelayOutput)(result.relayed)}\n`);
+}
 async function cmdPending(args) {
     const json = hasFlag(args, "--json");
     const sub = args[0];
@@ -471,6 +503,10 @@ async function main() {
     }
     if (args[0] === "listen") {
         await cmdListen(args.slice(1));
+        return;
+    }
+    if (args[0] === "relay") {
+        await cmdRelay(args.slice(1));
         return;
     }
     if (args[0] === "pending") {

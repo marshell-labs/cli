@@ -37,7 +37,7 @@ async function main() {
   if (context) {
     message = `Reply from ${from} (re: ${context}):\n${text}`;
   } else {
-    message = `Message from ${from}:\n${text}`;
+    message = `New from ${from}:\n${text}`;
   }
 
   if (webhook) {

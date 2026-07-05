@@ -18,6 +18,7 @@ import {
   listPending,
   trackPending,
 } from "./pending";
+import { formatRelayOutput, runRelayCron } from "./relay-cron";
 
 type JsonShape = Record<string, unknown>;
 
@@ -38,6 +39,7 @@ function printHelp(): void {
     "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
     "  marshell history [--with <name>] [--limit <n>] [--json]",
     "  marshell listen [--json] [--notify <cmd>]  (deliver-only listener)",
+    "  marshell relay cron [--include-untracked] [--json]",
     "  marshell pending list|clear [--peer <name>] [--json]",
     "  marshell --help",
     "",
@@ -454,6 +456,46 @@ async function cmdInbox(args: string[]): Promise<void> {
   }
 }
 
+async function cmdRelay(args: string[]): Promise<void> {
+  const sub = args[0];
+  if (sub !== "cron") {
+    printError("Usage: marshell relay cron [--include-untracked] [--json]");
+  }
+
+  const json = hasFlag(args, "--json");
+  const pendingOnly = !hasFlag(args, "--include-untracked");
+
+  const config = await readConfig();
+  const networkUrl = getNetworkUrl(config);
+  const result = await runRelayCron({ networkUrl, pendingOnly });
+
+  if (json) {
+    printJson({
+      ...result,
+      formatted: formatRelayOutput(result.relayed),
+    });
+    return;
+  }
+
+  if (result.message && result.relayed.length === 0) {
+    process.stdout.write(`${result.message}\n`);
+    return;
+  }
+
+  if (result.relayed.length === 0) {
+    process.stdout.write("Nothing new to relay.\n");
+    return;
+  }
+
+  if (result.pending_count === 0 && !pendingOnly) {
+    process.stdout.write(
+      `${result.relayed.length} new inbound message(s):\n\n`,
+    );
+  }
+
+  process.stdout.write(`${formatRelayOutput(result.relayed)}\n`);
+}
+
 async function cmdPending(args: string[]): Promise<void> {
   const json = hasFlag(args, "--json");
   const sub = args[0];
@@ -589,6 +631,11 @@ async function main(): Promise<void> {
 
   if (args[0] === "listen") {
     await cmdListen(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "relay") {
+    await cmdRelay(args.slice(1));
     return;
   }
 
