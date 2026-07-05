@@ -7,6 +7,12 @@ import {
   sendMessage,
   type InboxMessage,
 } from "./network";
+import {
+  clearPending,
+  listPending,
+  matchPending,
+  type PendingEntry,
+} from "./pending";
 
 export type BridgeOptions = {
   networkUrl: string;
@@ -15,6 +21,7 @@ export type BridgeOptions = {
   runtime: "cursor" | "hermes" | "fast";
   workspace: string;
   hook?: string;
+  notify?: string;
   json: boolean;
   replyTimeoutMs: number;
 };
@@ -330,6 +337,43 @@ async function generateRuntimeReply(
   return result.stdout.trim();
 }
 
+async function runNotifyCommand(
+  notify: string,
+  msg: InboxMessage,
+  pending: PendingEntry | null,
+): Promise<void> {
+  const payload = JSON.stringify({
+    event: "message",
+    id: msg.id,
+    from: msg.from,
+    text: msg.text,
+    created_at: msg.created_at,
+    pending: pending ?? undefined,
+  });
+
+  const timeoutMs = 30_000;
+
+  if (process.platform === "win32") {
+    const result = await spawnCommand(
+      "cmd.exe",
+      ["/d", "/s", "/c", notify],
+      { input: payload, timeoutMs },
+    );
+    if (result.code !== 0) {
+      throw new Error(result.stderr || result.stdout || "notify failed");
+    }
+    return;
+  }
+
+  const result = await spawnCommand("sh", ["-c", notify], {
+    input: payload,
+    timeoutMs,
+  });
+  if (result.code !== 0) {
+    throw new Error(result.stderr || result.stdout || "notify failed");
+  }
+}
+
 async function runHookReply(
   hook: string,
   msg: InboxMessage,
@@ -384,6 +428,10 @@ function emitEvent(json: boolean, event: Record<string, unknown>): void {
     process.stdout.write(`[reply] to=${event.to} id=${event.id}\n`);
   } else if (kind === "skip") {
     process.stdout.write(`[skip] from=${event.from} reason=${event.reason}\n`);
+  } else if (kind === "notify") {
+    process.stdout.write(
+      `[notify] from=${event.from} id=${event.id}${event.pending ? " (tracked)" : ""}\n`,
+    );
   } else if (kind === "error") {
     process.stderr.write(`[bridge] ${event.message}\n`);
   }
@@ -462,15 +510,41 @@ export async function handleInbound(
   msg: InboxMessage,
   options: BridgeOptions,
 ): Promise<void> {
+  const pending = await matchPending(msg.from);
+
   emitEvent(options.json, {
     type: "message",
     id: msg.id,
     from: msg.from,
     text: msg.text,
     created_at: msg.created_at,
+    pending: pending ?? undefined,
   });
 
-  // Always ack first so backlog never sticks.
+  // Push to human channel (Telegram, webhook, etc.) — side effect only.
+  if (options.notify && !isEcho(msg.from, msg.text)) {
+    try {
+      await runNotifyCommand(options.notify, msg, pending);
+      emitEvent(options.json, {
+        type: "notify",
+        from: msg.from,
+        id: msg.id,
+        pending: pending?.context,
+      });
+      if (pending) {
+        await clearPending(msg.from);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      emitEvent(options.json, {
+        type: "error",
+        message: `notify: ${message}`,
+        in_reply_to: msg.id,
+      });
+    }
+  }
+
+  // Always ack so backlog never sticks.
   await ackMessages(networkUrl, [msg.id]);
 
   // Drop echoes of our own recent outbound (hi↔hi loops).
@@ -512,16 +586,49 @@ export async function handleInbound(
   void processReplyAsync(networkUrl, msg, options);
 }
 
-async function drainBacklog(networkUrl: string, json: boolean): Promise<void> {
+async function drainBacklog(
+  networkUrl: string,
+  options: BridgeOptions,
+): Promise<void> {
   const result = await fetchInbox(networkUrl, { peek: true });
   if (result.kind !== "ok" || result.messages.length === 0) {
     return;
   }
+
+  // With --notify, deliver backlog for tracked peers only (avoid hi storms).
+  if (options.notify) {
+    const pendingPeers = new Set(
+      (await listPending()).map((p) => p.peer.toLowerCase()),
+    );
+    const messages = [...result.messages].sort((a, b) => {
+      const ta = Date.parse(a.created_at) || 0;
+      const tb = Date.parse(b.created_at) || 0;
+      return ta - tb;
+    });
+    let drained = 0;
+    for (const msg of messages) {
+      if (pendingPeers.has(msg.from.toLowerCase())) {
+        await handleInbound(networkUrl, msg, options);
+      } else {
+        await ackMessages(networkUrl, [msg.id]);
+        drained += 1;
+      }
+    }
+    if (drained > 0) {
+      emitEvent(options.json, {
+        type: "skip",
+        from: "*",
+        reason: `drained ${drained} untracked backlog message(s) on startup`,
+      });
+    }
+    return;
+  }
+
   await ackMessages(
     networkUrl,
     result.messages.map((m) => m.id),
   );
-  emitEvent(json, {
+  emitEvent(options.json, {
     type: "skip",
     from: "*",
     reason: `drained ${result.messages.length} backlog message(s) on startup`,
@@ -530,18 +637,23 @@ async function drainBacklog(networkUrl: string, json: boolean): Promise<void> {
 
 export async function runBridge(options: BridgeOptions): Promise<void> {
   const label = options.agentName ?? "agent";
-  const mode = options.hook
-    ? "hook"
-    : options.autoReply
-      ? options.runtime === "fast"
-        ? "fast-only"
-        : `auto-reply (${options.runtime})`
-      : "deliver-only";
+  const mode = options.notify
+    ? options.hook
+      ? "hook+notify"
+      : options.autoReply
+        ? `auto-reply (${options.runtime})+notify`
+        : "deliver+notify"
+    : options.hook
+      ? "hook"
+      : options.autoReply
+        ? options.runtime === "fast"
+          ? "fast-only"
+          : `auto-reply (${options.runtime})`
+        : "deliver-only";
 
   process.stdout.write(`Bridge listening as '${label}' (${mode}).\n`);
 
-  // Drop stale inbox so we don't replay an old hi storm.
-  await drainBacklog(options.networkUrl, options.json);
+  await drainBacklog(options.networkUrl, options);
 
   let stopped = false;
   const cleanup = (): void => {

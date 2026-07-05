@@ -13,6 +13,11 @@ import {
   sendMessage,
   waitForInbox,
 } from "./network";
+import {
+  clearPending,
+  listPending,
+  trackPending,
+} from "./pending";
 
 type JsonShape = Record<string, unknown>;
 
@@ -28,11 +33,12 @@ function printHelp(): void {
     "  marshell bridge run --auto-reply [--runtime cursor|hermes|fast] [--workspace <path>]",
     "  marshell agent run            (alias for bridge run)",
     "  marshell discover [--json]",
-    "  marshell send --to <name> --text \"...\" [--json]",
+    "  marshell send --to <name> --text \"...\" [--track [context]] [--json]",
     "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
     "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
     "  marshell history [--with <name>] [--limit <n>] [--json]",
-    "  marshell listen [--json]      (deliver-only listener)",
+    "  marshell listen [--json] [--notify <cmd>]  (deliver-only listener)",
+    "  marshell pending list|clear [--peer <name>] [--json]",
     "  marshell --help",
     "",
     "Middleware: send / inbox / history. Agents think; Marshell only delivers.",
@@ -44,6 +50,7 @@ function printHelp(): void {
     "  MARSHELL_AGENT_NAME   default agent name for auth set",
     "  MARSHELL_WORKSPACE    workspace for cursor auto-reply",
     "  MARSHELL_HOOK         default hook command for bridge",
+    "  MARSHELL_NOTIFY       default notify command for listen (--notify)",
     "  MARSHELL_CONFIG       optional path to config file",
   ].join("\n");
   process.stdout.write(`${message}\n`);
@@ -90,6 +97,22 @@ function valueForFlag(args: string[], flag: string): string | undefined {
   return args[index + 1];
 }
 
+function trackContextFromArgs(args: string[], fallback: string): string | undefined {
+  if (!hasFlag(args, "--track")) {
+    return undefined;
+  }
+  const explicit = valueForFlag(args, "--track");
+  if (explicit !== undefined) {
+    return explicit;
+  }
+  const trackIndex = args.indexOf("--track");
+  const next = args[trackIndex + 1];
+  if (next && !next.startsWith("--")) {
+    return next;
+  }
+  return fallback;
+}
+
 function bridgeOptionsFromArgs(args: string[]): BridgeOptions {
   const configPromise = readConfig();
   // sync read not available — caller must await
@@ -101,6 +124,7 @@ function bridgeOptionsFromArgs(args: string[]): BridgeOptions {
     process.env.MARSHELL_WORKSPACE ??
     process.cwd();
   const hook = valueForFlag(args, "--hook") ?? process.env.MARSHELL_HOOK;
+  const notify = valueForFlag(args, "--notify") ?? process.env.MARSHELL_NOTIFY;
   const runtimeFlag = valueForFlag(args, "--runtime");
   const runtime: BridgeOptions["runtime"] =
     runtimeFlag === "hermes" || runtimeFlag === "cursor" || runtimeFlag === "fast"
@@ -119,6 +143,7 @@ function bridgeOptionsFromArgs(args: string[]): BridgeOptions {
     runtime,
     workspace,
     hook,
+    notify,
     json,
     replyTimeoutMs,
   };
@@ -244,17 +269,32 @@ async function cmdSend(args: string[]): Promise<void> {
   const json = hasFlag(args, "--json");
   const to = valueForFlag(args, "--to");
   const text = valueForFlag(args, "--text");
+  const trackContext = trackContextFromArgs(args, text ?? "");
 
   if (!to || !text) {
-    printError("Usage: marshell send --to <name> --text \"...\" [--json]");
+    printError(
+      'Usage: marshell send --to <name> --text "..." [--track [context]] [--json]',
+    );
   }
 
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
   const result = await sendMessage(networkUrl, to, text);
 
+  if (result.kind === "sent" && trackContext) {
+    await trackPending(to, {
+      sentMessageId: result.id,
+      sentText: text,
+      context: trackContext,
+      sentAt: new Date().toISOString(),
+    });
+  }
+
   if (json) {
-    printJson(result as unknown as JsonShape);
+    printJson({
+      ...(result as unknown as JsonShape),
+      tracked: Boolean(trackContext && result.kind === "sent"),
+    });
     return;
   }
 
@@ -262,6 +302,9 @@ async function cmdSend(args: string[]): Promise<void> {
     process.stdout.write(
       `Sent message to '${to}' (id: ${result.id}, status: ${result.status}).\n`,
     );
+    if (trackContext) {
+      process.stdout.write(`Tracking reply from '${to}' (${trackContext}).\n`);
+    }
     return;
   }
 
@@ -285,8 +328,20 @@ async function cmdAsk(args: string[]): Promise<void> {
   const networkUrl = getNetworkUrl(config);
   const result = await askAgent(networkUrl, to, text, waitSeconds);
 
+  if (result.kind === "timeout") {
+    await trackPending(to, {
+      sentMessageId: result.sent_id,
+      sentText: text,
+      context: text,
+      sentAt: new Date().toISOString(),
+    });
+  }
+
   if (json) {
-    printJson(result as unknown as JsonShape);
+    printJson({
+      ...(result as unknown as JsonShape),
+      tracked: result.kind === "timeout",
+    });
     return;
   }
 
@@ -295,9 +350,10 @@ async function cmdAsk(args: string[]): Promise<void> {
     return;
   }
   if (result.kind === "timeout") {
-    printError(
-      `No reply from '${to}' within ${waitSeconds}s (sent id: ${result.sent_id}). Is their bridge running?`,
+    process.stderr.write(
+      `No reply from '${to}' within ${waitSeconds}s — tracking for later notify (sent id: ${result.sent_id}).\n`,
     );
+    process.exit(1);
   }
   printError(result.message);
 }
@@ -398,6 +454,47 @@ async function cmdInbox(args: string[]): Promise<void> {
   }
 }
 
+async function cmdPending(args: string[]): Promise<void> {
+  const json = hasFlag(args, "--json");
+  const sub = args[0];
+
+  if (sub === "list") {
+    const entries = await listPending();
+    if (json) {
+      printJson({ pending: entries });
+      return;
+    }
+    if (entries.length === 0) {
+      process.stdout.write("No pending replies.\n");
+      return;
+    }
+    for (const entry of entries) {
+      process.stdout.write(
+        `- ${entry.peer}: ${entry.context} (since ${entry.sentAt})\n`,
+      );
+    }
+    return;
+  }
+
+  if (sub === "clear") {
+    const peer = valueForFlag(args, "--peer");
+    if (!peer) {
+      printError("Usage: marshell pending clear --peer <name>");
+    }
+    const cleared = await clearPending(peer);
+    if (json) {
+      printJson({ peer, cleared });
+      return;
+    }
+    process.stdout.write(
+      cleared ? `Cleared pending for '${peer}'.\n` : `No pending for '${peer}'.\n`,
+    );
+    return;
+  }
+
+  printError("Usage: marshell pending list|clear [--peer <name>]");
+}
+
 async function cmdListen(args: string[]): Promise<void> {
   const waitRaw = valueForFlag(args, "--wait");
   const waitSeconds = waitRaw ? Number(waitRaw) : 0;
@@ -492,6 +589,11 @@ async function main(): Promise<void> {
 
   if (args[0] === "listen") {
     await cmdListen(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "pending") {
+    await cmdPending(args.slice(1));
     return;
   }
 

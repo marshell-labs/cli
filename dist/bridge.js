@@ -7,6 +7,7 @@ const node_child_process_1 = require("node:child_process");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const network_1 = require("./network");
+const pending_1 = require("./pending");
 const DEFAULT_REPLY_TIMEOUT_MS = 120_000;
 const GREETING_COOLDOWN_MS = 120_000;
 const ECHO_WINDOW_MS = 60_000;
@@ -257,6 +258,31 @@ async function generateRuntimeReply(msg, runtime, workspace, timeoutMs) {
     }
     return result.stdout.trim();
 }
+async function runNotifyCommand(notify, msg, pending) {
+    const payload = JSON.stringify({
+        event: "message",
+        id: msg.id,
+        from: msg.from,
+        text: msg.text,
+        created_at: msg.created_at,
+        pending: pending ?? undefined,
+    });
+    const timeoutMs = 30_000;
+    if (process.platform === "win32") {
+        const result = await spawnCommand("cmd.exe", ["/d", "/s", "/c", notify], { input: payload, timeoutMs });
+        if (result.code !== 0) {
+            throw new Error(result.stderr || result.stdout || "notify failed");
+        }
+        return;
+    }
+    const result = await spawnCommand("sh", ["-c", notify], {
+        input: payload,
+        timeoutMs,
+    });
+    if (result.code !== 0) {
+        throw new Error(result.stderr || result.stdout || "notify failed");
+    }
+}
 async function runHookReply(hook, msg, timeoutMs) {
     const payload = JSON.stringify({
         id: msg.id,
@@ -300,6 +326,9 @@ function emitEvent(json, event) {
     }
     else if (kind === "skip") {
         process.stdout.write(`[skip] from=${event.from} reason=${event.reason}\n`);
+    }
+    else if (kind === "notify") {
+        process.stdout.write(`[notify] from=${event.from} id=${event.id}${event.pending ? " (tracked)" : ""}\n`);
     }
     else if (kind === "error") {
         process.stderr.write(`[bridge] ${event.message}\n`);
@@ -357,14 +386,39 @@ async function processReplyAsync(networkUrl, msg, options) {
     }
 }
 async function handleInbound(networkUrl, msg, options) {
+    const pending = await (0, pending_1.matchPending)(msg.from);
     emitEvent(options.json, {
         type: "message",
         id: msg.id,
         from: msg.from,
         text: msg.text,
         created_at: msg.created_at,
+        pending: pending ?? undefined,
     });
-    // Always ack first so backlog never sticks.
+    // Push to human channel (Telegram, webhook, etc.) — side effect only.
+    if (options.notify && !isEcho(msg.from, msg.text)) {
+        try {
+            await runNotifyCommand(options.notify, msg, pending);
+            emitEvent(options.json, {
+                type: "notify",
+                from: msg.from,
+                id: msg.id,
+                pending: pending?.context,
+            });
+            if (pending) {
+                await (0, pending_1.clearPending)(msg.from);
+            }
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            emitEvent(options.json, {
+                type: "error",
+                message: `notify: ${message}`,
+                in_reply_to: msg.id,
+            });
+        }
+    }
+    // Always ack so backlog never sticks.
     await (0, network_1.ackMessages)(networkUrl, [msg.id]);
     // Drop echoes of our own recent outbound (hi↔hi loops).
     if (isEcho(msg.from, msg.text)) {
@@ -398,13 +452,40 @@ async function handleInbound(networkUrl, msg, options) {
     }
     void processReplyAsync(networkUrl, msg, options);
 }
-async function drainBacklog(networkUrl, json) {
+async function drainBacklog(networkUrl, options) {
     const result = await (0, network_1.fetchInbox)(networkUrl, { peek: true });
     if (result.kind !== "ok" || result.messages.length === 0) {
         return;
     }
+    // With --notify, deliver backlog for tracked peers only (avoid hi storms).
+    if (options.notify) {
+        const pendingPeers = new Set((await (0, pending_1.listPending)()).map((p) => p.peer.toLowerCase()));
+        const messages = [...result.messages].sort((a, b) => {
+            const ta = Date.parse(a.created_at) || 0;
+            const tb = Date.parse(b.created_at) || 0;
+            return ta - tb;
+        });
+        let drained = 0;
+        for (const msg of messages) {
+            if (pendingPeers.has(msg.from.toLowerCase())) {
+                await handleInbound(networkUrl, msg, options);
+            }
+            else {
+                await (0, network_1.ackMessages)(networkUrl, [msg.id]);
+                drained += 1;
+            }
+        }
+        if (drained > 0) {
+            emitEvent(options.json, {
+                type: "skip",
+                from: "*",
+                reason: `drained ${drained} untracked backlog message(s) on startup`,
+            });
+        }
+        return;
+    }
     await (0, network_1.ackMessages)(networkUrl, result.messages.map((m) => m.id));
-    emitEvent(json, {
+    emitEvent(options.json, {
         type: "skip",
         from: "*",
         reason: `drained ${result.messages.length} backlog message(s) on startup`,
@@ -412,16 +493,21 @@ async function drainBacklog(networkUrl, json) {
 }
 async function runBridge(options) {
     const label = options.agentName ?? "agent";
-    const mode = options.hook
-        ? "hook"
-        : options.autoReply
-            ? options.runtime === "fast"
-                ? "fast-only"
-                : `auto-reply (${options.runtime})`
-            : "deliver-only";
+    const mode = options.notify
+        ? options.hook
+            ? "hook+notify"
+            : options.autoReply
+                ? `auto-reply (${options.runtime})+notify`
+                : "deliver+notify"
+        : options.hook
+            ? "hook"
+            : options.autoReply
+                ? options.runtime === "fast"
+                    ? "fast-only"
+                    : `auto-reply (${options.runtime})`
+                : "deliver-only";
     process.stdout.write(`Bridge listening as '${label}' (${mode}).\n`);
-    // Drop stale inbox so we don't replay an old hi storm.
-    await drainBacklog(options.networkUrl, options.json);
+    await drainBacklog(options.networkUrl, options);
     let stopped = false;
     const cleanup = () => {
         if (stopped)

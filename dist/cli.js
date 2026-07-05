@@ -5,6 +5,7 @@ const node_os_1 = require("node:os");
 const bridge_1 = require("./bridge");
 const config_1 = require("./config");
 const network_1 = require("./network");
+const pending_1 = require("./pending");
 function printHelp() {
     const message = [
         "marshell - agent messaging bridge",
@@ -17,11 +18,12 @@ function printHelp() {
         "  marshell bridge run --auto-reply [--runtime cursor|hermes|fast] [--workspace <path>]",
         "  marshell agent run            (alias for bridge run)",
         "  marshell discover [--json]",
-        "  marshell send --to <name> --text \"...\" [--json]",
+        "  marshell send --to <name> --text \"...\" [--track [context]] [--json]",
         "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
         "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
         "  marshell history [--with <name>] [--limit <n>] [--json]",
-        "  marshell listen [--json]      (deliver-only listener)",
+        "  marshell listen [--json] [--notify <cmd>]  (deliver-only listener)",
+        "  marshell pending list|clear [--peer <name>] [--json]",
         "  marshell --help",
         "",
         "Middleware: send / inbox / history. Agents think; Marshell only delivers.",
@@ -33,6 +35,7 @@ function printHelp() {
         "  MARSHELL_AGENT_NAME   default agent name for auth set",
         "  MARSHELL_WORKSPACE    workspace for cursor auto-reply",
         "  MARSHELL_HOOK         default hook command for bridge",
+        "  MARSHELL_NOTIFY       default notify command for listen (--notify)",
         "  MARSHELL_CONFIG       optional path to config file",
     ].join("\n");
     process.stdout.write(`${message}\n`);
@@ -72,6 +75,21 @@ function valueForFlag(args, flag) {
     }
     return args[index + 1];
 }
+function trackContextFromArgs(args, fallback) {
+    if (!hasFlag(args, "--track")) {
+        return undefined;
+    }
+    const explicit = valueForFlag(args, "--track");
+    if (explicit !== undefined) {
+        return explicit;
+    }
+    const trackIndex = args.indexOf("--track");
+    const next = args[trackIndex + 1];
+    if (next && !next.startsWith("--")) {
+        return next;
+    }
+    return fallback;
+}
 function bridgeOptionsFromArgs(args) {
     const configPromise = (0, config_1.readConfig)();
     // sync read not available — caller must await
@@ -82,6 +100,7 @@ function bridgeOptionsFromArgs(args) {
         process.env.MARSHELL_WORKSPACE ??
         process.cwd();
     const hook = valueForFlag(args, "--hook") ?? process.env.MARSHELL_HOOK;
+    const notify = valueForFlag(args, "--notify") ?? process.env.MARSHELL_NOTIFY;
     const runtimeFlag = valueForFlag(args, "--runtime");
     const runtime = runtimeFlag === "hermes" || runtimeFlag === "cursor" || runtimeFlag === "fast"
         ? runtimeFlag
@@ -98,6 +117,7 @@ function bridgeOptionsFromArgs(args) {
         runtime,
         workspace,
         hook,
+        notify,
         json,
         replyTimeoutMs,
     };
@@ -198,18 +218,33 @@ async function cmdSend(args) {
     const json = hasFlag(args, "--json");
     const to = valueForFlag(args, "--to");
     const text = valueForFlag(args, "--text");
+    const trackContext = trackContextFromArgs(args, text ?? "");
     if (!to || !text) {
-        printError("Usage: marshell send --to <name> --text \"...\" [--json]");
+        printError('Usage: marshell send --to <name> --text "..." [--track [context]] [--json]');
     }
     const config = await (0, config_1.readConfig)();
     const networkUrl = (0, config_1.getNetworkUrl)(config);
     const result = await (0, network_1.sendMessage)(networkUrl, to, text);
+    if (result.kind === "sent" && trackContext) {
+        await (0, pending_1.trackPending)(to, {
+            sentMessageId: result.id,
+            sentText: text,
+            context: trackContext,
+            sentAt: new Date().toISOString(),
+        });
+    }
     if (json) {
-        printJson(result);
+        printJson({
+            ...result,
+            tracked: Boolean(trackContext && result.kind === "sent"),
+        });
         return;
     }
     if (result.kind === "sent") {
         process.stdout.write(`Sent message to '${to}' (id: ${result.id}, status: ${result.status}).\n`);
+        if (trackContext) {
+            process.stdout.write(`Tracking reply from '${to}' (${trackContext}).\n`);
+        }
         return;
     }
     printError(result.message);
@@ -226,8 +261,19 @@ async function cmdAsk(args) {
     const config = await (0, config_1.readConfig)();
     const networkUrl = (0, config_1.getNetworkUrl)(config);
     const result = await (0, network_1.askAgent)(networkUrl, to, text, waitSeconds);
+    if (result.kind === "timeout") {
+        await (0, pending_1.trackPending)(to, {
+            sentMessageId: result.sent_id,
+            sentText: text,
+            context: text,
+            sentAt: new Date().toISOString(),
+        });
+    }
     if (json) {
-        printJson(result);
+        printJson({
+            ...result,
+            tracked: result.kind === "timeout",
+        });
         return;
     }
     if (result.kind === "ok") {
@@ -235,7 +281,8 @@ async function cmdAsk(args) {
         return;
     }
     if (result.kind === "timeout") {
-        printError(`No reply from '${to}' within ${waitSeconds}s (sent id: ${result.sent_id}). Is their bridge running?`);
+        process.stderr.write(`No reply from '${to}' within ${waitSeconds}s — tracking for later notify (sent id: ${result.sent_id}).\n`);
+        process.exit(1);
     }
     printError(result.message);
 }
@@ -318,6 +365,39 @@ async function cmdInbox(args) {
         process.stdout.write(`[${msg.from}] ${msg.text}\n`);
     }
 }
+async function cmdPending(args) {
+    const json = hasFlag(args, "--json");
+    const sub = args[0];
+    if (sub === "list") {
+        const entries = await (0, pending_1.listPending)();
+        if (json) {
+            printJson({ pending: entries });
+            return;
+        }
+        if (entries.length === 0) {
+            process.stdout.write("No pending replies.\n");
+            return;
+        }
+        for (const entry of entries) {
+            process.stdout.write(`- ${entry.peer}: ${entry.context} (since ${entry.sentAt})\n`);
+        }
+        return;
+    }
+    if (sub === "clear") {
+        const peer = valueForFlag(args, "--peer");
+        if (!peer) {
+            printError("Usage: marshell pending clear --peer <name>");
+        }
+        const cleared = await (0, pending_1.clearPending)(peer);
+        if (json) {
+            printJson({ peer, cleared });
+            return;
+        }
+        process.stdout.write(cleared ? `Cleared pending for '${peer}'.\n` : `No pending for '${peer}'.\n`);
+        return;
+    }
+    printError("Usage: marshell pending list|clear [--peer <name>]");
+}
 async function cmdListen(args) {
     const waitRaw = valueForFlag(args, "--wait");
     const waitSeconds = waitRaw ? Number(waitRaw) : 0;
@@ -391,6 +471,10 @@ async function main() {
     }
     if (args[0] === "listen") {
         await cmdListen(args.slice(1));
+        return;
+    }
+    if (args[0] === "pending") {
+        await cmdPending(args.slice(1));
         return;
     }
     printError(`Unknown command '${args[0]}'. Run marshell --help`);
