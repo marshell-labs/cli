@@ -408,6 +408,7 @@ async function handleInbound(networkUrl, msg, options) {
             });
             if (pending) {
                 await (0, pending_1.clearPending)(msg.from);
+                await (0, relay_state_1.clearWaitingReported)(msg.from);
             }
             await (0, relay_state_1.markRelayed)([msg.id]);
         }

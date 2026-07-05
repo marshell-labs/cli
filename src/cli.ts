@@ -39,7 +39,7 @@ function printHelp(): void {
     "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
     "  marshell history [--with <name>] [--limit <n>] [--json]",
     "  marshell listen [--json] [--notify <cmd>]  (deliver-only listener)",
-    "  marshell relay cron [--include-untracked] [--json]",
+    "  marshell relay cron [--quiet] [--include-untracked] [--json]",
     "  marshell pending list|clear [--peer <name>] [--json]",
     "  marshell --help",
     "",
@@ -459,21 +459,28 @@ async function cmdInbox(args: string[]): Promise<void> {
 async function cmdRelay(args: string[]): Promise<void> {
   const sub = args[0];
   if (sub !== "cron") {
-    printError("Usage: marshell relay cron [--include-untracked] [--json]");
+    printError(
+      "Usage: marshell relay cron [--quiet] [--include-untracked] [--json]",
+    );
   }
 
   const json = hasFlag(args, "--json");
+  const quiet = hasFlag(args, "--quiet");
   const pendingOnly = !hasFlag(args, "--include-untracked");
 
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
-  const result = await runRelayCron({ networkUrl, pendingOnly });
+  const result = await runRelayCron({ networkUrl, pendingOnly, quiet });
 
   if (json) {
     printJson({
       ...result,
       formatted: formatRelayOutput(result.relayed),
     });
+    return;
+  }
+
+  if (!result.notify) {
     return;
   }
 
@@ -487,9 +494,9 @@ async function cmdRelay(args: string[]): Promise<void> {
     return;
   }
 
-  process.stdout.write(
-    result.message ?? "Nothing new to relay.\n",
-  );
+  if (result.message) {
+    process.stdout.write(`${result.message}\n`);
+  }
 }
 
 async function cmdPending(args: string[]): Promise<void> {

@@ -4,7 +4,13 @@ import {
   fetchInbox,
   type InboxMessage,
 } from "./network";
-import { filterUnrelayed, markRelayed } from "./relay-state";
+import {
+  clearWaitingReported,
+  filterUnrelayed,
+  markRelayed,
+  markWaitingReported,
+  shouldReportWaiting,
+} from "./relay-state";
 
 export type RelayItem = {
   kind: "reply" | "new";
@@ -19,6 +25,8 @@ export type RelayCronResult = {
   relayed: RelayItem[];
   skipped_relayed: number;
   message?: string;
+  /** False in --quiet mode when there is nothing worth messaging the human. */
+  notify: boolean;
 };
 
 function formatItem(item: RelayItem): string {
@@ -36,7 +44,9 @@ export function formatRelayOutput(items: RelayItem[]): string {
 export async function runRelayCron(options: {
   networkUrl: string;
   pendingOnly: boolean;
+  quiet?: boolean;
 }): Promise<RelayCronResult> {
+  const quiet = options.quiet ?? false;
   const pending = await listPending();
   const pendingMap = new Map<string, PendingEntry>(
     pending.map((p) => [p.peer.toLowerCase(), p]),
@@ -47,7 +57,10 @@ export async function runRelayCron(options: {
       pending_count: 0,
       relayed: [],
       skipped_relayed: 0,
-      message: "No pending tracked sends — list is empty.",
+      message: quiet
+        ? undefined
+        : "No pending tracked sends — list is empty.",
+      notify: !quiet,
     };
   }
 
@@ -84,19 +97,48 @@ export async function runRelayCron(options: {
 
   for (const peer of peersToClear) {
     await clearPending(peer);
+    await clearWaitingReported(peer);
+  }
+
+  if (items.length > 0) {
+    return {
+      pending_count: pending.length,
+      relayed: items,
+      skipped_relayed: skippedRelayed,
+      notify: true,
+    };
   }
 
   let message: string | undefined;
-  if (items.length === 0 && pending.length > 0) {
-    const names = pending.map((p) => p.peer).join(", ");
-    message = `Waiting for replies from: ${names}`;
+  let notify = !quiet;
+
+  if (pending.length > 0) {
+    const waitingPeers: string[] = [];
+    for (const entry of pending) {
+      const shouldReport = await shouldReportWaiting(entry.peer, entry.sentAt);
+      if (shouldReport) {
+        waitingPeers.push(entry.peer);
+        await markWaitingReported(entry.peer, entry.sentAt);
+      }
+    }
+    if (waitingPeers.length > 0) {
+      message = `Waiting for replies from: ${waitingPeers.join(", ")}`;
+      notify = true;
+    } else if (quiet) {
+      message = undefined;
+      notify = false;
+    } else {
+      message = `Still waiting for: ${pending.map((p) => p.peer).join(", ")}`;
+      notify = true;
+    }
   }
 
   return {
     pending_count: pending.length,
-    relayed: items,
+    relayed: [],
     skipped_relayed: skippedRelayed,
     message,
+    notify,
   };
 }
 
