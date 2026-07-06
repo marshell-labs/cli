@@ -11,11 +11,13 @@ exports.sendMessage = sendMessage;
 exports.fetchInbox = fetchInbox;
 exports.ackMessages = ackMessages;
 exports.waitForInbox = waitForInbox;
+exports.fetchMessageStatus = fetchMessageStatus;
+exports.waitForDelivery = waitForDelivery;
 exports.fetchHistory = fetchHistory;
 exports.askAgent = askAgent;
 exports.toWsUrl = toWsUrl;
 const config_1 = require("./config");
-exports.MARSHELL_CLI_VERSION = "0.7.9";
+exports.MARSHELL_CLI_VERSION = "0.8.0";
 function formatWalletLine(wallet) {
     const parts = [];
     if (wallet.free_remaining > 0) {
@@ -41,6 +43,33 @@ function parseWallet(raw) {
         prepaid_balance: w.prepaid_balance,
         messages_remaining: w.messages_remaining,
     };
+}
+async function getJson(url, headers) {
+    const attempts = 3;
+    for (let i = 0; i < attempts; i++) {
+        const response = await fetch(url, { method: "GET", headers });
+        const text = await response.text();
+        let data = {};
+        if (text.trim().length > 0) {
+            try {
+                data = JSON.parse(text);
+            }
+            catch {
+                data = { raw: text };
+            }
+        }
+        const result = { status: response.status, data: data };
+        if (isRetryableStatus(response.status) &&
+            i < attempts - 1) {
+            const waitMs = response.status === 429
+                ? parseRetryAfterSeconds(response.headers.get("Retry-After")) * 1000
+                : 250 * (i + 1);
+            await sleep(waitMs);
+            continue;
+        }
+        return result;
+    }
+    return { status: 0, data: {} };
 }
 function normalizeBaseUrl(raw) {
     return raw.endsWith("/") ? raw.slice(0, -1) : raw;
@@ -145,29 +174,13 @@ async function postJson(url, body, headers) {
         shouldRetry: (result) => isRetryableStatus(result.status),
     });
 }
-async function getJson(url, headers) {
-    return withRetry(async () => {
-        const response = await fetch(url, {
-            method: "GET",
-            headers,
-        });
-        const text = await response.text();
-        let data = {};
-        if (text.trim().length > 0) {
-            try {
-                data = JSON.parse(text);
-            }
-            catch {
-                data = { raw: text };
-            }
-        }
-        return {
-            status: response.status,
-            data: data,
-        };
-    }, {
-        shouldRetry: (result) => isRetryableStatus(result.status),
-    });
+function parseRetryAfterSeconds(raw) {
+    if (!raw)
+        return 60;
+    const n = Number(raw.trim());
+    if (Number.isFinite(n) && n > 0)
+        return Math.min(120, Math.ceil(n));
+    return 60;
 }
 async function joinAgent(baseUrl, name, options = {}) {
     const config = await (0, config_1.readConfig)();
@@ -267,57 +280,84 @@ async function fetchWallet(baseUrl) {
         return { kind: "error", message: error.message };
     }
 }
-async function sendMessage(baseUrl, to, text) {
+async function sendMessage(baseUrl, to, text, options = {}) {
     try {
         const headers = await authHeaders("agent");
-        // Sends are not idempotent — do not retry POST on 502/503/504.
-        const response = await fetch(withPath(baseUrl, "/v1/messages/send"), {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ to, text }),
-        });
-        const raw = await response.text();
-        let data = {};
-        if (raw.trim().length > 0) {
-            try {
-                data = JSON.parse(raw);
-            }
-            catch {
-                data = { error: raw };
-            }
+        if (options.correlationId?.trim()) {
+            headers["x-correlation-id"] = options.correlationId.trim();
         }
-        const result = { status: response.status, data };
-        const wallet = parseWallet(result.data.wallet);
-        if (result.status === 402) {
+        const body = { to, text };
+        if (options.correlationId?.trim()) {
+            body.correlation_id = options.correlationId.trim();
+        }
+        const attempts = 2;
+        let lastStatus = 0;
+        let lastData = {};
+        for (let i = 0; i < attempts; i++) {
+            const response = await fetch(withPath(baseUrl, "/v1/messages/send"), {
+                method: "POST",
+                headers,
+                body: JSON.stringify(body),
+            });
+            lastStatus = response.status;
+            const raw = await response.text();
+            if (raw.trim().length > 0) {
+                try {
+                    lastData = JSON.parse(raw);
+                }
+                catch {
+                    lastData = { error: raw };
+                }
+            }
+            if (response.status === 429 && i < attempts - 1) {
+                await sleep(parseRetryAfterSeconds(response.headers.get("Retry-After")) * 1000);
+                continue;
+            }
+            break;
+        }
+        const wallet = parseWallet(lastData.wallet);
+        if (lastStatus === 402) {
             return {
                 kind: "error",
                 status: 402,
-                code: result.data.code ?? "payment_required",
-                message: result.data.error ?? "No message credits remaining.",
+                code: lastData.code ?? "payment_required",
+                message: lastData.error ?? "No message credits remaining.",
                 wallet,
-                action: result.data.action ??
+                action: lastData.action ??
                     "Ask the subnet owner to top up at https://console.marshell.dev/dashboard/billing",
             };
         }
-        if (result.status >= 200 && result.status < 300 && result.data.id) {
+        if (lastStatus === 429) {
+            return {
+                kind: "error",
+                status: 429,
+                code: "rate_limited",
+                message: lastData.error ??
+                    "Rate limit exceeded. Retry after the Retry-After interval.",
+            };
+        }
+        if (lastStatus >= 200 && lastStatus < 300 && lastData.id) {
             if (!wallet) {
                 return {
                     kind: "error",
                     message: "Send succeeded but wallet balance was missing from response.",
-                    status: result.status,
+                    status: lastStatus,
                 };
             }
             return {
                 kind: "sent",
-                id: result.data.id,
-                status: result.data.status ?? "delivered",
+                id: lastData.id,
+                status: lastData.status ?? "delivered",
                 wallet,
+                poll_status: lastData.poll_status ??
+                    `/v1/messages/status?ids=${lastData.id}`,
+                correlation_id: lastData.correlation_id,
             };
         }
         return {
             kind: "error",
-            status: result.status,
-            message: result.data.error ?? `Send failed with HTTP ${result.status}.`,
+            status: lastStatus,
+            message: lastData.error ?? `Send failed with HTTP ${lastStatus}.`,
             wallet,
         };
     }
@@ -383,6 +423,19 @@ async function ackMessages(baseUrl, ids) {
 async function waitForInbox(baseUrl, options) {
     const deadline = Date.now() + options.waitSeconds * 1000;
     const from = options.from?.toLowerCase();
+    let sinceMs = 0;
+    if (options.sinceMessageId) {
+        const history = await fetchHistory(baseUrl, {
+            with: options.from,
+            limit: 100,
+        });
+        if (history.kind === "ok") {
+            const sent = history.messages.find((m) => m.id === options.sinceMessageId);
+            if (sent) {
+                sinceMs = Date.parse(sent.created_at) - 2000;
+            }
+        }
+    }
     while (Date.now() < deadline) {
         const remaining = Math.max(1, Math.min(30, Math.ceil((deadline - Date.now()) / 1000)));
         const result = await fetchInbox(baseUrl, {
@@ -393,7 +446,15 @@ async function waitForInbox(baseUrl, options) {
             return result;
         }
         const messages = from
-            ? result.messages.filter((m) => m.from.toLowerCase() === from)
+            ? result.messages.filter((m) => {
+                if (m.from.toLowerCase() !== from)
+                    return false;
+                if (sinceMs > 0) {
+                    const created = Date.parse(m.created_at);
+                    return !Number.isNaN(created) && created >= sinceMs;
+                }
+                return true;
+            })
             : result.messages;
         if (messages.length > 0) {
             await ackMessages(baseUrl, messages.map((m) => m.id));
@@ -401,6 +462,49 @@ async function waitForInbox(baseUrl, options) {
         }
     }
     return { kind: "timeout" };
+}
+async function fetchMessageStatus(baseUrl, ids, waitSeconds = 0) {
+    if (ids.length === 0) {
+        return { kind: "ok", receipts: [] };
+    }
+    try {
+        const headers = await authHeaders("agent");
+        const params = new URLSearchParams({ ids: ids.join(",") });
+        if (waitSeconds > 0) {
+            params.set("wait", String(Math.min(120, waitSeconds)));
+        }
+        const result = await getJson(withPath(baseUrl, `/v1/messages/status?${params}`), headers);
+        if (result.status < 200 || result.status >= 300) {
+            return {
+                kind: "error",
+                status: result.status,
+                message: result.data.error ?? `Status failed with HTTP ${result.status}.`,
+            };
+        }
+        return { kind: "ok", receipts: result.data.receipts ?? [] };
+    }
+    catch (error) {
+        return { kind: "error", message: error.message };
+    }
+}
+async function waitForDelivery(baseUrl, messageId, timeoutSeconds) {
+    const deadline = Date.now() + timeoutSeconds * 1000;
+    let lastStatus;
+    while (Date.now() < deadline) {
+        const remaining = Math.max(1, Math.min(30, Math.ceil((deadline - Date.now()) / 1000)));
+        const result = await fetchMessageStatus(baseUrl, [messageId], remaining);
+        if (result.kind === "error") {
+            return result;
+        }
+        const receipt = result.receipts[0];
+        if (receipt) {
+            lastStatus = receipt.status;
+            if (receipt.status === "received") {
+                return { kind: "ok", status: receipt.status, receipt };
+            }
+        }
+    }
+    return { kind: "timeout", last_status: lastStatus };
 }
 async function fetchHistory(baseUrl, options) {
     try {
@@ -432,8 +536,10 @@ async function fetchHistory(baseUrl, options) {
         return { kind: "error", message: error.message };
     }
 }
-async function askAgent(baseUrl, to, text, waitSeconds) {
-    // Drain any stale messages from this peer before asking.
+async function askAgent(baseUrl, to, text, options) {
+    const opts = typeof options === "number" ? { waitSeconds: options } : options;
+    const waitSeconds = opts.waitSeconds;
+    const pollDelivery = opts.pollDelivery !== false;
     const stale = await fetchInbox(baseUrl, { peek: true });
     if (stale.kind === "ok") {
         const fromPeer = stale.messages.filter((m) => m.from.toLowerCase() === to.toLowerCase());
@@ -441,15 +547,31 @@ async function askAgent(baseUrl, to, text, waitSeconds) {
             await ackMessages(baseUrl, fromPeer.map((m) => m.id));
         }
     }
-    const sentAt = Date.now() - 2000;
-    const sent = await sendMessage(baseUrl, to, text);
+    const sent = await sendMessage(baseUrl, to, text, {
+        correlationId: opts.correlationId,
+    });
     if (sent.kind !== "sent") {
         return { kind: "error", message: sent.message };
     }
+    if (opts.noWait) {
+        return {
+            kind: "sent",
+            sent_id: sent.id,
+            poll_status: sent.poll_status,
+        };
+    }
+    const sentAt = Date.now() - 2000;
     const deadline = Date.now() + waitSeconds * 1000;
     const peer = to.toLowerCase();
+    let deliveryStatus = sent.status;
     while (Date.now() < deadline) {
         const remaining = Math.max(1, Math.min(30, Math.ceil((deadline - Date.now()) / 1000)));
+        if (pollDelivery && deliveryStatus !== "received") {
+            const delivery = await fetchMessageStatus(baseUrl, [sent.id], Math.min(10, remaining));
+            if (delivery.kind === "ok" && delivery.receipts[0]) {
+                deliveryStatus = delivery.receipts[0].status;
+            }
+        }
         const result = await fetchInbox(baseUrl, {
             peek: true,
             waitSeconds: remaining,
@@ -469,10 +591,17 @@ async function askAgent(baseUrl, to, text, waitSeconds) {
                 kind: "ok",
                 reply: messages.map((m) => m.text.trim()).join("\n\n"),
                 message_id: messages[0]?.id ?? sent.id,
+                sent_id: sent.id,
+                delivery_status: deliveryStatus,
             };
         }
     }
-    return { kind: "timeout", sent_id: sent.id };
+    return {
+        kind: "timeout",
+        sent_id: sent.id,
+        delivery_status: deliveryStatus,
+        tracked: opts.trackOnTimeout,
+    };
 }
 function toWsUrl(httpBase) {
     const url = new URL(httpBase);

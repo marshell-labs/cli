@@ -11,7 +11,7 @@ export type JoinResponse = {
   agent_card_url?: string;
 };
 
-export const MARSHELL_CLI_VERSION = "0.7.9";
+export const MARSHELL_CLI_VERSION = "0.8.0";
 
 export type JoinAgentOptions = {
   description?: string;
@@ -67,6 +67,39 @@ type HttpResult<T> = {
   status: number;
   data: T;
 };
+
+async function getJson<T>(
+  url: string,
+  headers: Record<string, string>,
+): Promise<HttpResult<T>> {
+  const attempts = 3;
+  for (let i = 0; i < attempts; i++) {
+    const response = await fetch(url, { method: "GET", headers });
+    const text = await response.text();
+    let data: unknown = {};
+    if (text.trim().length > 0) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { raw: text };
+      }
+    }
+    const result = { status: response.status, data: data as T };
+    if (
+      isRetryableStatus(response.status) &&
+      i < attempts - 1
+    ) {
+      const waitMs =
+        response.status === 429
+          ? parseRetryAfterSeconds(response.headers.get("Retry-After")) * 1000
+          : 250 * (i + 1);
+      await sleep(waitMs);
+      continue;
+    }
+    return result;
+  }
+  return { status: 0, data: {} as T };
+}
 
 function normalizeBaseUrl(raw: string): string {
   return raw.endsWith("/") ? raw.slice(0, -1) : raw;
@@ -195,34 +228,11 @@ async function postJson<T>(
   );
 }
 
-async function getJson<T>(
-  url: string,
-  headers: Record<string, string>,
-): Promise<HttpResult<T>> {
-  return withRetry(
-    async () => {
-      const response = await fetch(url, {
-        method: "GET",
-        headers,
-      });
-      const text = await response.text();
-      let data: unknown = {};
-      if (text.trim().length > 0) {
-        try {
-          data = JSON.parse(text);
-        } catch {
-          data = { raw: text };
-        }
-      }
-      return {
-        status: response.status,
-        data: data as T,
-      };
-    },
-    {
-      shouldRetry: (result) => isRetryableStatus(result.status),
-    },
-  );
+function parseRetryAfterSeconds(raw: string | null): number {
+  if (!raw) return 60;
+  const n = Number(raw.trim());
+  if (Number.isFinite(n) && n > 0) return Math.min(120, Math.ceil(n));
+  return 60;
 }
 
 export async function joinAgent(
@@ -358,12 +368,32 @@ export async function fetchWallet(
   }
 }
 
+export type SendOptions = {
+  correlationId?: string;
+};
+
+export type MessageReceipt = {
+  message_id: string;
+  status: string;
+  from?: string;
+  to?: string;
+  updated_at?: string;
+};
+
 export async function sendMessage(
   baseUrl: string,
   to: string,
   text: string,
+  options: SendOptions = {},
 ): Promise<
-  | { kind: "sent"; id: string; status: string; wallet: WalletSnapshot }
+  | {
+      kind: "sent";
+      id: string;
+      status: string;
+      wallet: WalletSnapshot;
+      poll_status: string;
+      correlation_id?: string;
+    }
   | {
       kind: "error";
       message: string;
@@ -375,65 +405,101 @@ export async function sendMessage(
 > {
   try {
     const headers = await authHeaders("agent");
-    // Sends are not idempotent — do not retry POST on 502/503/504.
-    const response = await fetch(withPath(baseUrl, "/v1/messages/send"), {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ to, text }),
-    });
-    const raw = await response.text();
-    let data: {
+    if (options.correlationId?.trim()) {
+      headers["x-correlation-id"] = options.correlationId.trim();
+    }
+    const body: Record<string, string> = { to, text };
+    if (options.correlationId?.trim()) {
+      body.correlation_id = options.correlationId.trim();
+    }
+
+    const attempts = 2;
+    let lastStatus = 0;
+    let lastData: {
       id?: string;
       status?: string;
       wallet?: WalletSnapshot;
       error?: string;
       code?: string;
       action?: string;
+      poll_status?: string;
+      correlation_id?: string;
     } = {};
-    if (raw.trim().length > 0) {
-      try {
-        data = JSON.parse(raw) as typeof data;
-      } catch {
-        data = { error: raw };
+
+    for (let i = 0; i < attempts; i++) {
+      const response = await fetch(withPath(baseUrl, "/v1/messages/send"), {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      lastStatus = response.status;
+      const raw = await response.text();
+      if (raw.trim().length > 0) {
+        try {
+          lastData = JSON.parse(raw) as typeof lastData;
+        } catch {
+          lastData = { error: raw };
+        }
       }
+      if (response.status === 429 && i < attempts - 1) {
+        await sleep(
+          parseRetryAfterSeconds(response.headers.get("Retry-After")) * 1000,
+        );
+        continue;
+      }
+      break;
     }
-    const result = { status: response.status, data };
 
-    const wallet = parseWallet(result.data.wallet);
+    const wallet = parseWallet(lastData.wallet);
 
-    if (result.status === 402) {
+    if (lastStatus === 402) {
       return {
         kind: "error",
         status: 402,
-        code: result.data.code ?? "payment_required",
-        message: result.data.error ?? "No message credits remaining.",
+        code: lastData.code ?? "payment_required",
+        message: lastData.error ?? "No message credits remaining.",
         wallet,
         action:
-          result.data.action ??
+          lastData.action ??
           "Ask the subnet owner to top up at https://console.marshell.dev/dashboard/billing",
       };
     }
 
-    if (result.status >= 200 && result.status < 300 && result.data.id) {
+    if (lastStatus === 429) {
+      return {
+        kind: "error",
+        status: 429,
+        code: "rate_limited",
+        message:
+          lastData.error ??
+          "Rate limit exceeded. Retry after the Retry-After interval.",
+      };
+    }
+
+    if (lastStatus >= 200 && lastStatus < 300 && lastData.id) {
       if (!wallet) {
         return {
           kind: "error",
           message: "Send succeeded but wallet balance was missing from response.",
-          status: result.status,
+          status: lastStatus,
         };
       }
       return {
         kind: "sent",
-        id: result.data.id,
-        status: result.data.status ?? "delivered",
+        id: lastData.id,
+        status: lastData.status ?? "delivered",
         wallet,
+        poll_status:
+          lastData.poll_status ??
+          `/v1/messages/status?ids=${lastData.id}`,
+        correlation_id: lastData.correlation_id,
       };
     }
 
     return {
       kind: "error",
-      status: result.status,
-      message: result.data.error ?? `Send failed with HTTP ${result.status}.`,
+      status: lastStatus,
+      message: lastData.error ?? `Send failed with HTTP ${lastStatus}.`,
       wallet,
     };
   } catch (error) {
@@ -517,7 +583,7 @@ export async function ackMessages(
 
 export async function waitForInbox(
   baseUrl: string,
-  options: { waitSeconds: number; from?: string },
+  options: { waitSeconds: number; from?: string; sinceMessageId?: string },
 ): Promise<
   | { kind: "ok"; messages: InboxMessage[]; agent: string }
   | { kind: "timeout" }
@@ -525,6 +591,20 @@ export async function waitForInbox(
 > {
   const deadline = Date.now() + options.waitSeconds * 1000;
   const from = options.from?.toLowerCase();
+  let sinceMs = 0;
+
+  if (options.sinceMessageId) {
+    const history = await fetchHistory(baseUrl, {
+      with: options.from,
+      limit: 100,
+    });
+    if (history.kind === "ok") {
+      const sent = history.messages.find((m) => m.id === options.sinceMessageId);
+      if (sent) {
+        sinceMs = Date.parse(sent.created_at) - 2000;
+      }
+    }
+  }
 
   while (Date.now() < deadline) {
     const remaining = Math.max(
@@ -540,7 +620,14 @@ export async function waitForInbox(
     }
 
     const messages = from
-      ? result.messages.filter((m) => m.from.toLowerCase() === from)
+      ? result.messages.filter((m) => {
+          if (m.from.toLowerCase() !== from) return false;
+          if (sinceMs > 0) {
+            const created = Date.parse(m.created_at);
+            return !Number.isNaN(created) && created >= sinceMs;
+          }
+          return true;
+        })
       : result.messages;
 
     if (messages.length > 0) {
@@ -561,6 +648,83 @@ export type HistoryMessage = {
   peer: string;
   text: string;
   created_at: string;
+  correlation_id?: string;
+};
+
+export async function fetchMessageStatus(
+  baseUrl: string,
+  ids: string[],
+  waitSeconds = 0,
+): Promise<
+  | { kind: "ok"; receipts: MessageReceipt[] }
+  | { kind: "error"; message: string; status?: number }
+> {
+  if (ids.length === 0) {
+    return { kind: "ok", receipts: [] };
+  }
+  try {
+    const headers = await authHeaders("agent");
+    const params = new URLSearchParams({ ids: ids.join(",") });
+    if (waitSeconds > 0) {
+      params.set("wait", String(Math.min(120, waitSeconds)));
+    }
+    const result = await getJson<{
+      receipts?: MessageReceipt[];
+      error?: string;
+    }>(withPath(baseUrl, `/v1/messages/status?${params}`), headers);
+
+    if (result.status < 200 || result.status >= 300) {
+      return {
+        kind: "error",
+        status: result.status,
+        message: result.data.error ?? `Status failed with HTTP ${result.status}.`,
+      };
+    }
+    return { kind: "ok", receipts: result.data.receipts ?? [] };
+  } catch (error) {
+    return { kind: "error", message: (error as Error).message };
+  }
+}
+
+export async function waitForDelivery(
+  baseUrl: string,
+  messageId: string,
+  timeoutSeconds: number,
+): Promise<
+  | { kind: "ok"; status: string; receipt?: MessageReceipt }
+  | { kind: "timeout"; last_status?: string }
+  | { kind: "error"; message: string }
+> {
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  let lastStatus: string | undefined;
+
+  while (Date.now() < deadline) {
+    const remaining = Math.max(
+      1,
+      Math.min(30, Math.ceil((deadline - Date.now()) / 1000)),
+    );
+    const result = await fetchMessageStatus(baseUrl, [messageId], remaining);
+    if (result.kind === "error") {
+      return result;
+    }
+    const receipt = result.receipts[0];
+    if (receipt) {
+      lastStatus = receipt.status;
+      if (receipt.status === "received") {
+        return { kind: "ok", status: receipt.status, receipt };
+      }
+    }
+  }
+
+  return { kind: "timeout", last_status: lastStatus };
+}
+
+export type AskOptions = {
+  waitSeconds: number;
+  noWait?: boolean;
+  pollDelivery?: boolean;
+  correlationId?: string;
+  trackOnTimeout?: boolean;
 };
 
 export async function fetchHistory(
@@ -610,13 +774,24 @@ export async function askAgent(
   baseUrl: string,
   to: string,
   text: string,
-  waitSeconds: number,
+  options: AskOptions | number,
 ): Promise<
-  | { kind: "ok"; reply: string; message_id: string }
-  | { kind: "timeout"; sent_id: string }
+  | {
+      kind: "ok";
+      reply: string;
+      message_id: string;
+      sent_id: string;
+      delivery_status?: string;
+    }
+  | { kind: "sent"; sent_id: string; poll_status: string; tracked?: boolean }
+  | { kind: "timeout"; sent_id: string; delivery_status?: string; tracked?: boolean }
   | { kind: "error"; message: string }
 > {
-  // Drain any stale messages from this peer before asking.
+  const opts: AskOptions =
+    typeof options === "number" ? { waitSeconds: options } : options;
+  const waitSeconds = opts.waitSeconds;
+  const pollDelivery = opts.pollDelivery !== false;
+
   const stale = await fetchInbox(baseUrl, { peek: true });
   if (stale.kind === "ok") {
     const fromPeer = stale.messages.filter(
@@ -630,20 +805,43 @@ export async function askAgent(
     }
   }
 
-  const sentAt = Date.now() - 2000;
-  const sent = await sendMessage(baseUrl, to, text);
+  const sent = await sendMessage(baseUrl, to, text, {
+    correlationId: opts.correlationId,
+  });
   if (sent.kind !== "sent") {
     return { kind: "error", message: sent.message };
   }
 
+  if (opts.noWait) {
+    return {
+      kind: "sent",
+      sent_id: sent.id,
+      poll_status: sent.poll_status,
+    };
+  }
+
+  const sentAt = Date.now() - 2000;
   const deadline = Date.now() + waitSeconds * 1000;
   const peer = to.toLowerCase();
+  let deliveryStatus = sent.status;
 
   while (Date.now() < deadline) {
     const remaining = Math.max(
       1,
       Math.min(30, Math.ceil((deadline - Date.now()) / 1000)),
     );
+
+    if (pollDelivery && deliveryStatus !== "received") {
+      const delivery = await fetchMessageStatus(
+        baseUrl,
+        [sent.id],
+        Math.min(10, remaining),
+      );
+      if (delivery.kind === "ok" && delivery.receipts[0]) {
+        deliveryStatus = delivery.receipts[0].status;
+      }
+    }
+
     const result = await fetchInbox(baseUrl, {
       peek: true,
       waitSeconds: remaining,
@@ -667,11 +865,18 @@ export async function askAgent(
         kind: "ok",
         reply: messages.map((m) => m.text.trim()).join("\n\n"),
         message_id: messages[0]?.id ?? sent.id,
+        sent_id: sent.id,
+        delivery_status: deliveryStatus,
       };
     }
   }
 
-  return { kind: "timeout", sent_id: sent.id };
+  return {
+    kind: "timeout",
+    sent_id: sent.id,
+    delivery_status: deliveryStatus,
+    tracked: opts.trackOnTimeout,
+  };
 }
 
 export function toWsUrl(httpBase: string): string {

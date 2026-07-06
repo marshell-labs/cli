@@ -19,9 +19,11 @@ function printHelp() {
         "  marshell bridge run --auto-reply [--runtime cursor|hermes|fast] [--workspace <path>]",
         "  marshell agent run            (alias for bridge run)",
         "  marshell discover [--json] [--a2a]",
-        "  marshell send --to <name> --text \"...\" [--track [context]] [--json]",
+        "  marshell send --to <name> --text \"...\" [--async] [--track [context]] [--correlation-id <id>] [--json]",
         "  marshell wallet [--json]",
-        "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
+        "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--no-wait] [--json]",
+        "  marshell wait --from <name> [--since <msg_id>] [--timeout <seconds>] [--json]",
+        "  marshell status --ids <msg_id>[,...] [--wait <seconds>] [--json]",
         "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
         "  marshell history [--with <name>] [--limit <n>] [--json]",
         "  marshell listen [--json] [--notify <cmd>]  (deliver-only listener)",
@@ -231,15 +233,17 @@ async function cmdDiscover(args) {
 }
 async function cmdSend(args) {
     const json = hasFlag(args, "--json");
+    const asyncSend = hasFlag(args, "--async");
     const to = valueForFlag(args, "--to");
     const text = valueForFlag(args, "--text");
+    const correlationId = valueForFlag(args, "--correlation-id");
     const trackContext = trackContextFromArgs(args, text ?? "");
     if (!to || !text) {
-        printError('Usage: marshell send --to <name> --text "..." [--track [context]] [--json]');
+        printError('Usage: marshell send --to <name> --text "..." [--async] [--track [context]] [--correlation-id <id>] [--json]');
     }
     const config = await (0, config_1.readConfig)();
     const networkUrl = (0, config_1.getNetworkUrl)(config);
-    const result = await (0, network_1.sendMessage)(networkUrl, to, text);
+    const result = await (0, network_1.sendMessage)(networkUrl, to, text, { correlationId });
     if (result.kind === "sent" && trackContext) {
         await (0, pending_1.trackPending)(to, {
             sentMessageId: result.id,
@@ -257,12 +261,16 @@ async function cmdSend(args) {
     }
     if (result.kind === "sent") {
         process.stdout.write(`Sent message to '${to}' (id: ${result.id}, status: ${result.status}).\n`);
+        process.stdout.write(`Poll delivery: marshell status --ids ${result.id} --wait 30\n`);
         process.stdout.write(`${(0, network_1.formatWalletLine)(result.wallet)}\n`);
         if (result.wallet.messages_remaining <= 10) {
             process.stdout.write("Low balance — tell the owner to top up at https://console.marshell.dev/dashboard/billing\n");
         }
         if (trackContext) {
             process.stdout.write(`Tracking reply from '${to}' (${trackContext}).\n`);
+        }
+        if (asyncSend) {
+            process.stdout.write(`Async mode — wait for reply: marshell wait --from ${to} --since ${result.id}\n`);
         }
         return;
     }
@@ -271,6 +279,10 @@ async function cmdSend(args) {
     }
     if (result.status === 402) {
         printError(`${result.message} ${result.action ?? "Top up at console.marshell.dev/dashboard/billing"}`);
+        return;
+    }
+    if (result.status === 429) {
+        printError(`${result.message} Wait and retry — do not resend the same text.`);
         return;
     }
     printError(result.message);
@@ -293,16 +305,23 @@ async function cmdWallet(args) {
 }
 async function cmdAsk(args) {
     const json = hasFlag(args, "--json");
+    const noWait = hasFlag(args, "--no-wait");
     const to = valueForFlag(args, "--to");
     const text = valueForFlag(args, "--text");
     const waitRaw = valueForFlag(args, "--wait");
-    const waitSeconds = waitRaw ? Number(waitRaw) : 120;
+    const correlationId = valueForFlag(args, "--correlation-id");
+    const waitSeconds = waitRaw ? Number(waitRaw) : 300;
     if (!to || !text) {
-        printError("Usage: marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]");
+        printError('Usage: marshell ask --to <name> --text "..." [--wait <seconds>] [--no-wait] [--correlation-id <id>] [--json]');
     }
     const config = await (0, config_1.readConfig)();
     const networkUrl = (0, config_1.getNetworkUrl)(config);
-    const result = await (0, network_1.askAgent)(networkUrl, to, text, waitSeconds);
+    const result = await (0, network_1.askAgent)(networkUrl, to, text, {
+        waitSeconds,
+        noWait,
+        correlationId,
+        trackOnTimeout: true,
+    });
     if (result.kind === "timeout") {
         await (0, pending_1.trackPending)(to, {
             sentMessageId: result.sent_id,
@@ -319,14 +338,84 @@ async function cmdAsk(args) {
         return;
     }
     if (result.kind === "ok") {
+        if (result.delivery_status && result.delivery_status !== "received") {
+            process.stderr.write(`Note: delivery status is '${result.delivery_status}' (peer may not have read inbox yet).\n`);
+        }
         process.stdout.write(`${result.reply}\n`);
         return;
     }
+    if (result.kind === "sent") {
+        process.stdout.write(`Sent to '${to}' (id: ${result.sent_id}). Wait: marshell wait --from ${to} --since ${result.sent_id}\n`);
+        return;
+    }
     if (result.kind === "timeout") {
-        process.stderr.write(`No reply from '${to}' within ${waitSeconds}s — tracking for later notify (sent id: ${result.sent_id}).\n`);
-        process.exit(1);
+        process.stderr.write(`No reply from '${to}' within ${waitSeconds}s — tracked (sent id: ${result.sent_id}). Do not resend the same text.\n`);
+        process.stderr.write(`Wait later: marshell wait --from ${to} --since ${result.sent_id} --timeout 300\n`);
+        return;
     }
     printError(result.message);
+}
+async function cmdWait(args) {
+    const json = hasFlag(args, "--json");
+    const from = valueForFlag(args, "--from");
+    const since = valueForFlag(args, "--since");
+    const timeoutRaw = valueForFlag(args, "--timeout");
+    const timeoutSeconds = timeoutRaw ? Number(timeoutRaw) : 300;
+    if (!from) {
+        printError("Usage: marshell wait --from <name> [--since <msg_id>] [--timeout <seconds>] [--json]");
+    }
+    const config = await (0, config_1.readConfig)();
+    const networkUrl = (0, config_1.getNetworkUrl)(config);
+    const result = await (0, network_1.waitForInbox)(networkUrl, {
+        waitSeconds: timeoutSeconds,
+        from,
+        sinceMessageId: since,
+    });
+    if (result.kind === "error") {
+        printError(result.message);
+    }
+    if (result.kind === "timeout") {
+        if (json) {
+            printJson({ timed_out: true, from, since });
+            return;
+        }
+        process.stderr.write(`No reply from '${from}' within ${timeoutSeconds}s. Do not resend — try again later.\n`);
+        return;
+    }
+    if (json) {
+        printJson({ from, messages: result.messages, agent: result.agent });
+        return;
+    }
+    for (const msg of result.messages) {
+        process.stdout.write(`${msg.text}\n`);
+    }
+}
+async function cmdStatus(args) {
+    const json = hasFlag(args, "--json");
+    const idsRaw = valueForFlag(args, "--ids");
+    const waitRaw = valueForFlag(args, "--wait");
+    const waitSeconds = waitRaw ? Number(waitRaw) : 0;
+    if (!idsRaw) {
+        printError("Usage: marshell status --ids <msg_id>[,...] [--wait <seconds>] [--json]");
+    }
+    const ids = idsRaw.split(",").map((id) => id.trim()).filter(Boolean);
+    const config = await (0, config_1.readConfig)();
+    const networkUrl = (0, config_1.getNetworkUrl)(config);
+    const result = await (0, network_1.fetchMessageStatus)(networkUrl, ids, waitSeconds);
+    if (result.kind === "error") {
+        printError(result.message);
+    }
+    if (json) {
+        printJson({ receipts: result.receipts });
+        return;
+    }
+    if (result.receipts.length === 0) {
+        process.stdout.write("No receipt yet (still delivering).\n");
+        return;
+    }
+    for (const receipt of result.receipts) {
+        process.stdout.write(`${receipt.message_id}: ${receipt.status}${receipt.updated_at ? ` (${receipt.updated_at})` : ""}\n`);
+    }
 }
 async function cmdHistory(args) {
     const json = hasFlag(args, "--json");
@@ -537,6 +626,14 @@ async function main() {
     }
     if (args[0] === "ask") {
         await cmdAsk(args.slice(1));
+        return;
+    }
+    if (args[0] === "wait") {
+        await cmdWait(args.slice(1));
+        return;
+    }
+    if (args[0] === "status") {
+        await cmdStatus(args.slice(1));
         return;
     }
     if (args[0] === "inbox") {

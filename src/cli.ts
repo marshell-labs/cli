@@ -8,6 +8,7 @@ import {
   discoverPeers,
   fetchHistory,
   fetchInbox,
+  fetchMessageStatus,
   fetchWallet,
   formatWalletLine,
   joinAgent,
@@ -36,9 +37,11 @@ function printHelp(): void {
     "  marshell bridge run --auto-reply [--runtime cursor|hermes|fast] [--workspace <path>]",
     "  marshell agent run            (alias for bridge run)",
     "  marshell discover [--json] [--a2a]",
-    "  marshell send --to <name> --text \"...\" [--track [context]] [--json]",
+    "  marshell send --to <name> --text \"...\" [--async] [--track [context]] [--correlation-id <id>] [--json]",
     "  marshell wallet [--json]",
-    "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
+    "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--no-wait] [--json]",
+    "  marshell wait --from <name> [--since <msg_id>] [--timeout <seconds>] [--json]",
+    "  marshell status --ids <msg_id>[,...] [--wait <seconds>] [--json]",
     "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
     "  marshell history [--with <name>] [--limit <n>] [--json]",
     "  marshell listen [--json] [--notify <cmd>]  (deliver-only listener)",
@@ -286,19 +289,21 @@ async function cmdDiscover(args: string[]): Promise<void> {
 
 async function cmdSend(args: string[]): Promise<void> {
   const json = hasFlag(args, "--json");
+  const asyncSend = hasFlag(args, "--async");
   const to = valueForFlag(args, "--to");
   const text = valueForFlag(args, "--text");
+  const correlationId = valueForFlag(args, "--correlation-id");
   const trackContext = trackContextFromArgs(args, text ?? "");
 
   if (!to || !text) {
     printError(
-      'Usage: marshell send --to <name> --text "..." [--track [context]] [--json]',
+      'Usage: marshell send --to <name> --text "..." [--async] [--track [context]] [--correlation-id <id>] [--json]',
     );
   }
 
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
-  const result = await sendMessage(networkUrl, to, text);
+  const result = await sendMessage(networkUrl, to, text, { correlationId });
 
   if (result.kind === "sent" && trackContext) {
     await trackPending(to, {
@@ -321,6 +326,7 @@ async function cmdSend(args: string[]): Promise<void> {
     process.stdout.write(
       `Sent message to '${to}' (id: ${result.id}, status: ${result.status}).\n`,
     );
+    process.stdout.write(`Poll delivery: marshell status --ids ${result.id} --wait 30\n`);
     process.stdout.write(`${formatWalletLine(result.wallet)}\n`);
     if (result.wallet.messages_remaining <= 10) {
       process.stdout.write(
@@ -329,6 +335,11 @@ async function cmdSend(args: string[]): Promise<void> {
     }
     if (trackContext) {
       process.stdout.write(`Tracking reply from '${to}' (${trackContext}).\n`);
+    }
+    if (asyncSend) {
+      process.stdout.write(
+        `Async mode — wait for reply: marshell wait --from ${to} --since ${result.id}\n`,
+      );
     }
     return;
   }
@@ -340,6 +351,10 @@ async function cmdSend(args: string[]): Promise<void> {
     printError(
       `${result.message} ${result.action ?? "Top up at console.marshell.dev/dashboard/billing"}`,
     );
+    return;
+  }
+  if (result.status === 429) {
+    printError(`${result.message} Wait and retry — do not resend the same text.`);
     return;
   }
 
@@ -368,20 +383,27 @@ async function cmdWallet(args: string[]): Promise<void> {
 
 async function cmdAsk(args: string[]): Promise<void> {
   const json = hasFlag(args, "--json");
+  const noWait = hasFlag(args, "--no-wait");
   const to = valueForFlag(args, "--to");
   const text = valueForFlag(args, "--text");
   const waitRaw = valueForFlag(args, "--wait");
-  const waitSeconds = waitRaw ? Number(waitRaw) : 120;
+  const correlationId = valueForFlag(args, "--correlation-id");
+  const waitSeconds = waitRaw ? Number(waitRaw) : 300;
 
   if (!to || !text) {
     printError(
-      "Usage: marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
+      'Usage: marshell ask --to <name> --text "..." [--wait <seconds>] [--no-wait] [--correlation-id <id>] [--json]',
     );
   }
 
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
-  const result = await askAgent(networkUrl, to, text, waitSeconds);
+  const result = await askAgent(networkUrl, to, text, {
+    waitSeconds,
+    noWait,
+    correlationId,
+    trackOnTimeout: true,
+  });
 
   if (result.kind === "timeout") {
     await trackPending(to, {
@@ -401,16 +423,111 @@ async function cmdAsk(args: string[]): Promise<void> {
   }
 
   if (result.kind === "ok") {
+    if (result.delivery_status && result.delivery_status !== "received") {
+      process.stderr.write(
+        `Note: delivery status is '${result.delivery_status}' (peer may not have read inbox yet).\n`,
+      );
+    }
     process.stdout.write(`${result.reply}\n`);
+    return;
+  }
+  if (result.kind === "sent") {
+    process.stdout.write(
+      `Sent to '${to}' (id: ${result.sent_id}). Wait: marshell wait --from ${to} --since ${result.sent_id}\n`,
+    );
     return;
   }
   if (result.kind === "timeout") {
     process.stderr.write(
-      `No reply from '${to}' within ${waitSeconds}s — tracking for later notify (sent id: ${result.sent_id}).\n`,
+      `No reply from '${to}' within ${waitSeconds}s — tracked (sent id: ${result.sent_id}). Do not resend the same text.\n`,
     );
-    process.exit(1);
+    process.stderr.write(
+      `Wait later: marshell wait --from ${to} --since ${result.sent_id} --timeout 300\n`,
+    );
+    return;
   }
   printError(result.message);
+}
+
+async function cmdWait(args: string[]): Promise<void> {
+  const json = hasFlag(args, "--json");
+  const from = valueForFlag(args, "--from");
+  const since = valueForFlag(args, "--since");
+  const timeoutRaw = valueForFlag(args, "--timeout");
+  const timeoutSeconds = timeoutRaw ? Number(timeoutRaw) : 300;
+
+  if (!from) {
+    printError(
+      "Usage: marshell wait --from <name> [--since <msg_id>] [--timeout <seconds>] [--json]",
+    );
+  }
+
+  const config = await readConfig();
+  const networkUrl = getNetworkUrl(config);
+  const result = await waitForInbox(networkUrl, {
+    waitSeconds: timeoutSeconds,
+    from,
+    sinceMessageId: since,
+  });
+
+  if (result.kind === "error") {
+    printError(result.message);
+  }
+  if (result.kind === "timeout") {
+    if (json) {
+      printJson({ timed_out: true, from, since });
+      return;
+    }
+    process.stderr.write(
+      `No reply from '${from}' within ${timeoutSeconds}s. Do not resend — try again later.\n`,
+    );
+    return;
+  }
+
+  if (json) {
+    printJson({ from, messages: result.messages, agent: result.agent });
+    return;
+  }
+
+  for (const msg of result.messages) {
+    process.stdout.write(`${msg.text}\n`);
+  }
+}
+
+async function cmdStatus(args: string[]): Promise<void> {
+  const json = hasFlag(args, "--json");
+  const idsRaw = valueForFlag(args, "--ids");
+  const waitRaw = valueForFlag(args, "--wait");
+  const waitSeconds = waitRaw ? Number(waitRaw) : 0;
+
+  if (!idsRaw) {
+    printError("Usage: marshell status --ids <msg_id>[,...] [--wait <seconds>] [--json]");
+  }
+
+  const ids = idsRaw.split(",").map((id) => id.trim()).filter(Boolean);
+  const config = await readConfig();
+  const networkUrl = getNetworkUrl(config);
+  const result = await fetchMessageStatus(networkUrl, ids, waitSeconds);
+
+  if (result.kind === "error") {
+    printError(result.message);
+  }
+
+  if (json) {
+    printJson({ receipts: result.receipts });
+    return;
+  }
+
+  if (result.receipts.length === 0) {
+    process.stdout.write("No receipt yet (still delivering).\n");
+    return;
+  }
+
+  for (const receipt of result.receipts) {
+    process.stdout.write(
+      `${receipt.message_id}: ${receipt.status}${receipt.updated_at ? ` (${receipt.updated_at})` : ""}\n`,
+    );
+  }
 }
 
 async function cmdHistory(args: string[]): Promise<void> {
@@ -677,6 +794,16 @@ async function main(): Promise<void> {
 
   if (args[0] === "ask") {
     await cmdAsk(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "wait") {
+    await cmdWait(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "status") {
+    await cmdStatus(args.slice(1));
     return;
   }
 
