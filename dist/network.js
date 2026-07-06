@@ -15,7 +15,7 @@ exports.fetchHistory = fetchHistory;
 exports.askAgent = askAgent;
 exports.toWsUrl = toWsUrl;
 const config_1 = require("./config");
-exports.MARSHELL_CLI_VERSION = "0.7.8";
+exports.MARSHELL_CLI_VERSION = "0.7.9";
 function formatWalletLine(wallet) {
     const parts = [];
     if (wallet.free_remaining > 0) {
@@ -270,7 +270,23 @@ async function fetchWallet(baseUrl) {
 async function sendMessage(baseUrl, to, text) {
     try {
         const headers = await authHeaders("agent");
-        const result = await postJson(withPath(baseUrl, "/v1/messages/send"), { to, text }, headers);
+        // Sends are not idempotent — do not retry POST on 502/503/504.
+        const response = await fetch(withPath(baseUrl, "/v1/messages/send"), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ to, text }),
+        });
+        const raw = await response.text();
+        let data = {};
+        if (raw.trim().length > 0) {
+            try {
+                data = JSON.parse(raw);
+            }
+            catch {
+                data = { error: raw };
+            }
+        }
+        const result = { status: response.status, data };
         const wallet = parseWallet(result.data.wallet);
         if (result.status === 402) {
             return {

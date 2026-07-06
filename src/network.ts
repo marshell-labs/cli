@@ -11,7 +11,7 @@ export type JoinResponse = {
   agent_card_url?: string;
 };
 
-export const MARSHELL_CLI_VERSION = "0.7.8";
+export const MARSHELL_CLI_VERSION = "0.7.9";
 
 export type JoinAgentOptions = {
   description?: string;
@@ -375,18 +375,29 @@ export async function sendMessage(
 > {
   try {
     const headers = await authHeaders("agent");
-    const result = await postJson<{
+    // Sends are not idempotent — do not retry POST on 502/503/504.
+    const response = await fetch(withPath(baseUrl, "/v1/messages/send"), {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ to, text }),
+    });
+    const raw = await response.text();
+    let data: {
       id?: string;
       status?: string;
       wallet?: WalletSnapshot;
       error?: string;
       code?: string;
       action?: string;
-    }>(
-      withPath(baseUrl, "/v1/messages/send"),
-      { to, text },
-      headers,
-    );
+    } = {};
+    if (raw.trim().length > 0) {
+      try {
+        data = JSON.parse(raw) as typeof data;
+      } catch {
+        data = { error: raw };
+      }
+    }
+    const result = { status: response.status, data };
 
     const wallet = parseWallet(result.data.wallet);
 
