@@ -11,7 +11,7 @@ export type JoinResponse = {
   agent_card_url?: string;
 };
 
-export const MARSHELL_CLI_VERSION = "0.7.7";
+export const MARSHELL_CLI_VERSION = "0.7.8";
 
 export type JoinAgentOptions = {
   description?: string;
@@ -126,32 +126,103 @@ export async function pingNetwork(baseUrl: string): Promise<HealthStatus> {
   };
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  opts?: {
+    attempts?: number;
+    shouldRetry?: (result: T) => boolean;
+  },
+): Promise<T> {
+  const attempts = opts?.attempts ?? 3;
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const result = await fn();
+      if (!opts?.shouldRetry?.(result) || i === attempts - 1) {
+        return result;
+      }
+    } catch (error) {
+      lastError = error;
+      if (i === attempts - 1) {
+        throw error;
+      }
+    }
+    await sleep(250 * (i + 1));
+  }
+  throw lastError instanceof Error ? lastError : new Error("request failed");
+}
+
 async function postJson<T>(
   url: string,
   body: unknown,
   headers: Record<string, string>,
 ): Promise<HttpResult<T>> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
+  return withRetry(
+    async () => {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
 
-  const text = await response.text();
-  let data: unknown = {};
+      const text = await response.text();
+      let data: unknown = {};
 
-  if (text.trim().length > 0) {
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { raw: text };
-    }
-  }
+      if (text.trim().length > 0) {
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = { raw: text };
+        }
+      }
 
-  return {
-    status: response.status,
-    data: data as T,
-  };
+      return {
+        status: response.status,
+        data: data as T,
+      };
+    },
+    {
+      shouldRetry: (result) => isRetryableStatus(result.status),
+    },
+  );
+}
+
+async function getJson<T>(
+  url: string,
+  headers: Record<string, string>,
+): Promise<HttpResult<T>> {
+  return withRetry(
+    async () => {
+      const response = await fetch(url, {
+        method: "GET",
+        headers,
+      });
+      const text = await response.text();
+      let data: unknown = {};
+      if (text.trim().length > 0) {
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = { raw: text };
+        }
+      }
+      return {
+        status: response.status,
+        data: data as T,
+      };
+    },
+    {
+      shouldRetry: (result) => isRetryableStatus(result.status),
+    },
+  );
 }
 
 export async function joinAgent(
@@ -369,38 +440,35 @@ export async function fetchInbox(
   | { kind: "ok"; messages: InboxMessage[]; agent: string }
   | { kind: "error"; message: string; status?: number }
 > {
+  const peek = options?.peek !== false;
   try {
     const headers = await authHeaders("agent");
     const params = new URLSearchParams();
-    if (options?.peek) {
+    if (peek) {
       params.set("peek", "1");
     }
     if (options?.waitSeconds && options.waitSeconds > 0) {
       params.set("wait", String(Math.min(120, options.waitSeconds)));
     }
     const qs = params.size > 0 ? `?${params.toString()}` : "";
-    const response = await fetch(withPath(baseUrl, `/v1/messages/inbox${qs}`), {
-      method: "GET",
-      headers,
-    });
-    const data = (await response.json()) as {
+    const result = await getJson<{
       messages?: InboxMessage[];
       agent?: string;
       error?: string;
-    };
+    }>(withPath(baseUrl, `/v1/messages/inbox${qs}`), headers);
 
-    if (!response.ok) {
+    if (result.status < 200 || result.status >= 300) {
       return {
         kind: "error",
-        status: response.status,
-        message: data.error ?? `Inbox failed with HTTP ${response.status}.`,
+        status: result.status,
+        message: result.data.error ?? `Inbox failed with HTTP ${result.status}.`,
       };
     }
 
     return {
       kind: "ok",
-      messages: data.messages ?? [],
-      agent: data.agent ?? "",
+      messages: result.data.messages ?? [],
+      agent: result.data.agent ?? "",
     };
   } catch (error) {
     return {
