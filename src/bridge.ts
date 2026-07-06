@@ -7,6 +7,7 @@ import {
   sendMessage,
   type InboxMessage,
 } from "./network";
+import { runNotifyWithRetry } from "./notify";
 import {
   clearPending,
   listPending,
@@ -338,43 +339,6 @@ async function generateRuntimeReply(
   return result.stdout.trim();
 }
 
-async function runNotifyCommand(
-  notify: string,
-  msg: InboxMessage,
-  pending: PendingEntry | null,
-): Promise<void> {
-  const payload = JSON.stringify({
-    event: "message",
-    id: msg.id,
-    from: msg.from,
-    text: msg.text,
-    created_at: msg.created_at,
-    pending: pending ?? undefined,
-  });
-
-  const timeoutMs = 30_000;
-
-  if (process.platform === "win32") {
-    const result = await spawnCommand(
-      "cmd.exe",
-      ["/d", "/s", "/c", notify],
-      { input: payload, timeoutMs },
-    );
-    if (result.code !== 0) {
-      throw new Error(result.stderr || result.stdout || "notify failed");
-    }
-    return;
-  }
-
-  const result = await spawnCommand("sh", ["-c", notify], {
-    input: payload,
-    timeoutMs,
-  });
-  if (result.code !== 0) {
-    throw new Error(result.stderr || result.stdout || "notify failed");
-  }
-}
-
 async function runHookReply(
   hook: string,
   msg: InboxMessage,
@@ -525,7 +489,7 @@ export async function handleInbound(
   // Push to human channel. On failure, leave message in inbox for `relay cron`.
   if (options.notify && !isEcho(msg.from, msg.text)) {
     try {
-      await runNotifyCommand(options.notify, msg, pending);
+      await runNotifyWithRetry(options.notify, msg, pending);
       emitEvent(options.json, {
         type: "notify",
         from: msg.from,

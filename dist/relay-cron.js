@@ -4,6 +4,7 @@ exports.formatRelayOutput = formatRelayOutput;
 exports.runRelayCron = runRelayCron;
 const pending_1 = require("./pending");
 const network_1 = require("./network");
+const notify_1 = require("./notify");
 const relay_state_1 = require("./relay-state");
 function formatItem(item) {
     if (item.kind === "reply" && item.context) {
@@ -40,17 +41,45 @@ async function runRelayCron(options) {
     const items = [];
     const toAck = [];
     const peersToClear = new Set();
+    const notifyCommand = options.notifyCommand?.trim();
     for (const msg of unrelayed) {
         const peer = msg.from.toLowerCase();
         const tracked = pendingMap.get(peer);
         if (tracked) {
-            items.push(buildItem(msg, tracked, "reply"));
-            toAck.push(msg.id);
-            peersToClear.add(peer);
+            const item = buildItem(msg, tracked, "reply");
+            if (notifyCommand) {
+                try {
+                    await (0, notify_1.runNotifyWithRetry)(notifyCommand, msg, tracked);
+                    items.push(item);
+                    toAck.push(msg.id);
+                    peersToClear.add(peer);
+                }
+                catch {
+                    // Leave in inbox — bridge or next cron will retry webhook delivery.
+                }
+            }
+            else {
+                items.push(item);
+                toAck.push(msg.id);
+                peersToClear.add(peer);
+            }
         }
         else if (!options.pendingOnly) {
-            items.push(buildItem(msg, null, "new"));
-            toAck.push(msg.id);
+            const item = buildItem(msg, null, "new");
+            if (notifyCommand) {
+                try {
+                    await (0, notify_1.runNotifyWithRetry)(notifyCommand, msg, null);
+                    items.push(item);
+                    toAck.push(msg.id);
+                }
+                catch {
+                    // Leave in inbox for retry.
+                }
+            }
+            else {
+                items.push(item);
+                toAck.push(msg.id);
+            }
         }
     }
     if (toAck.length > 0) {

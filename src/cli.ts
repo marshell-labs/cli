@@ -14,6 +14,7 @@ import {
   joinAgent,
   pingNetwork,
   sendMessage,
+  sendMessageWithRecovery,
   waitForInbox,
 } from "./network";
 import {
@@ -303,7 +304,9 @@ async function cmdSend(args: string[]): Promise<void> {
 
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
-  const result = await sendMessage(networkUrl, to, text, { correlationId });
+  const result = await sendMessageWithRecovery(networkUrl, to, text, {
+    correlationId,
+  });
 
   if (result.kind === "sent" && trackContext) {
     await trackPending(to, {
@@ -640,7 +643,12 @@ async function cmdRelay(args: string[]): Promise<void> {
 
   const config = await readConfig();
   const networkUrl = getNetworkUrl(config);
-  const result = await runRelayCron({ networkUrl, pendingOnly, quiet });
+  const result = await runRelayCron({
+    networkUrl,
+    pendingOnly,
+    quiet,
+    notifyCommand: process.env.MARSHELL_NOTIFY,
+  });
 
   if (json) {
     printJson({

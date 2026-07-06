@@ -243,7 +243,9 @@ async function cmdSend(args) {
     }
     const config = await (0, config_1.readConfig)();
     const networkUrl = (0, config_1.getNetworkUrl)(config);
-    const result = await (0, network_1.sendMessage)(networkUrl, to, text, { correlationId });
+    const result = await (0, network_1.sendMessageWithRecovery)(networkUrl, to, text, {
+        correlationId,
+    });
     if (result.kind === "sent" && trackContext) {
         await (0, pending_1.trackPending)(to, {
             sentMessageId: result.id,
@@ -506,7 +508,12 @@ async function cmdRelay(args) {
     const pendingOnly = !hasFlag(args, "--include-untracked");
     const config = await (0, config_1.readConfig)();
     const networkUrl = (0, config_1.getNetworkUrl)(config);
-    const result = await (0, relay_cron_1.runRelayCron)({ networkUrl, pendingOnly, quiet });
+    const result = await (0, relay_cron_1.runRelayCron)({
+        networkUrl,
+        pendingOnly,
+        quiet,
+        notifyCommand: process.env.MARSHELL_NOTIFY,
+    });
     if (json) {
         printJson({
             ...result,

@@ -4,6 +4,7 @@ import {
   fetchInbox,
   type InboxMessage,
 } from "./network";
+import { runNotifyWithRetry } from "./notify";
 import {
   clearWaitingReported,
   filterUnrelayed,
@@ -45,6 +46,7 @@ export async function runRelayCron(options: {
   networkUrl: string;
   pendingOnly: boolean;
   quiet?: boolean;
+  notifyCommand?: string;
 }): Promise<RelayCronResult> {
   const quiet = options.quiet ?? false;
   const pending = await listPending();
@@ -75,18 +77,42 @@ export async function runRelayCron(options: {
   const items: RelayItem[] = [];
   const toAck: string[] = [];
   const peersToClear = new Set<string>();
+  const notifyCommand = options.notifyCommand?.trim();
 
   for (const msg of unrelayed) {
     const peer = msg.from.toLowerCase();
     const tracked = pendingMap.get(peer);
 
     if (tracked) {
-      items.push(buildItem(msg, tracked, "reply"));
-      toAck.push(msg.id);
-      peersToClear.add(peer);
+      const item = buildItem(msg, tracked, "reply");
+      if (notifyCommand) {
+        try {
+          await runNotifyWithRetry(notifyCommand, msg, tracked);
+          items.push(item);
+          toAck.push(msg.id);
+          peersToClear.add(peer);
+        } catch {
+          // Leave in inbox — bridge or next cron will retry webhook delivery.
+        }
+      } else {
+        items.push(item);
+        toAck.push(msg.id);
+        peersToClear.add(peer);
+      }
     } else if (!options.pendingOnly) {
-      items.push(buildItem(msg, null, "new"));
-      toAck.push(msg.id);
+      const item = buildItem(msg, null, "new");
+      if (notifyCommand) {
+        try {
+          await runNotifyWithRetry(notifyCommand, msg, null);
+          items.push(item);
+          toAck.push(msg.id);
+        } catch {
+          // Leave in inbox for retry.
+        }
+      } else {
+        items.push(item);
+        toAck.push(msg.id);
+      }
     }
   }
 

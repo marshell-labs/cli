@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readConfig } from "./config";
 
 export type HealthStatus = {
@@ -11,7 +12,7 @@ export type JoinResponse = {
   agent_card_url?: string;
 };
 
-export const MARSHELL_CLI_VERSION = "0.8.0";
+export const MARSHELL_CLI_VERSION = "0.8.1";
 
 export type JoinAgentOptions = {
   description?: string;
@@ -370,7 +371,69 @@ export async function fetchWallet(
 
 export type SendOptions = {
   correlationId?: string;
+  clientMessageId?: string;
 };
+
+export function defaultClientMessageId(): string {
+  return `cmid_${randomUUID()}`;
+}
+
+type SendSuccess = {
+  kind: "sent";
+  id: string;
+  status: string;
+  wallet: WalletSnapshot;
+  poll_status: string;
+  correlation_id?: string;
+  client_message_id?: string;
+};
+
+type SendError = {
+  kind: "error";
+  message: string;
+  status?: number;
+  code?: string;
+  wallet?: WalletSnapshot;
+  action?: string;
+  recovered_id?: string;
+};
+
+function isAmbiguousSendFailure(status: number | undefined): boolean {
+  return (
+    status === undefined ||
+    status === 0 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504
+  );
+}
+
+async function recoverSentMessageId(
+  baseUrl: string,
+  to: string,
+  text: string,
+  opts: {
+    correlationId?: string;
+    clientMessageId?: string;
+    sinceMs: number;
+  },
+): Promise<string | undefined> {
+  const history = await fetchHistory(baseUrl, { with: to, limit: 30 });
+  if (history.kind !== "ok") return undefined;
+  for (const m of history.messages) {
+    if (m.direction !== "out") continue;
+    const created = Date.parse(m.created_at);
+    if (Number.isNaN(created) || created < opts.sinceMs) continue;
+    if (opts.clientMessageId && m.client_message_id === opts.clientMessageId) {
+      return m.id;
+    }
+    if (opts.correlationId && m.correlation_id === opts.correlationId) {
+      return m.id;
+    }
+    if (m.text === text) return m.id;
+  }
+  return undefined;
+}
 
 export type MessageReceipt = {
   message_id: string;
@@ -385,121 +448,104 @@ export async function sendMessage(
   to: string,
   text: string,
   options: SendOptions = {},
-): Promise<
-  | {
-      kind: "sent";
-      id: string;
-      status: string;
-      wallet: WalletSnapshot;
-      poll_status: string;
-      correlation_id?: string;
-    }
-  | {
-      kind: "error";
-      message: string;
-      status?: number;
-      code?: string;
-      wallet?: WalletSnapshot;
-      action?: string;
-    }
-> {
+): Promise<SendSuccess | SendError> {
   try {
     const headers = await authHeaders("agent");
+    const clientMessageId =
+      options.clientMessageId?.trim() || defaultClientMessageId();
     if (options.correlationId?.trim()) {
       headers["x-correlation-id"] = options.correlationId.trim();
     }
-    const body: Record<string, string> = { to, text };
+    headers["idempotency-key"] = clientMessageId;
+    const body: Record<string, string> = { to, text, client_message_id: clientMessageId };
     if (options.correlationId?.trim()) {
       body.correlation_id = options.correlationId.trim();
     }
 
-    const attempts = 2;
-    let lastStatus = 0;
-    let lastData: {
-      id?: string;
-      status?: string;
-      wallet?: WalletSnapshot;
-      error?: string;
-      code?: string;
-      action?: string;
-      poll_status?: string;
-      correlation_id?: string;
-    } = {};
-
-    for (let i = 0; i < attempts; i++) {
-      const response = await fetch(withPath(baseUrl, "/v1/messages/send"), {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      });
-      lastStatus = response.status;
-      const raw = await response.text();
-      if (raw.trim().length > 0) {
-        try {
-          lastData = JSON.parse(raw) as typeof lastData;
-        } catch {
-          lastData = { error: raw };
+    const result = await withRetry(
+      async () => {
+        const response = await fetch(withPath(baseUrl, "/v1/messages/send"), {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        });
+        const raw = await response.text();
+        let data: {
+          id?: string;
+          status?: string;
+          wallet?: WalletSnapshot;
+          error?: string;
+          code?: string;
+          action?: string;
+          poll_status?: string;
+          correlation_id?: string;
+        } = {};
+        if (raw.trim().length > 0) {
+          try {
+            data = JSON.parse(raw) as typeof data;
+          } catch {
+            data = { error: raw };
+          }
         }
-      }
-      if (response.status === 429 && i < attempts - 1) {
-        await sleep(
-          parseRetryAfterSeconds(response.headers.get("Retry-After")) * 1000,
-        );
-        continue;
-      }
-      break;
-    }
+        return { status: response.status, data };
+      },
+      {
+        attempts: 3,
+        shouldRetry: (r) => isRetryableStatus(r.status),
+      },
+    );
 
-    const wallet = parseWallet(lastData.wallet);
+    const wallet = parseWallet(result.data.wallet);
 
-    if (lastStatus === 402) {
+    if (result.status === 402) {
       return {
         kind: "error",
         status: 402,
-        code: lastData.code ?? "payment_required",
-        message: lastData.error ?? "No message credits remaining.",
+        code: result.data.code ?? "payment_required",
+        message: result.data.error ?? "No message credits remaining.",
         wallet,
         action:
-          lastData.action ??
+          result.data.action ??
           "Ask the subnet owner to top up at https://console.marshell.dev/dashboard/billing",
       };
     }
 
-    if (lastStatus === 429) {
+    if (result.status === 429) {
       return {
         kind: "error",
         status: 429,
         code: "rate_limited",
         message:
-          lastData.error ??
+          result.data.error ??
           "Rate limit exceeded. Retry after the Retry-After interval.",
       };
     }
 
-    if (lastStatus >= 200 && lastStatus < 300 && lastData.id) {
+    if (result.status >= 200 && result.status < 300 && result.data.id) {
       if (!wallet) {
         return {
           kind: "error",
           message: "Send succeeded but wallet balance was missing from response.",
-          status: lastStatus,
+          status: result.status,
         };
       }
       return {
         kind: "sent",
-        id: lastData.id,
-        status: lastData.status ?? "delivered",
+        id: result.data.id,
+        status: result.data.status ?? "delivered",
         wallet,
         poll_status:
-          lastData.poll_status ??
-          `/v1/messages/status?ids=${lastData.id}`,
-        correlation_id: lastData.correlation_id,
+          result.data.poll_status ??
+          `/v1/messages/status?ids=${result.data.id}`,
+        correlation_id: result.data.correlation_id,
+        client_message_id: clientMessageId,
       };
     }
 
     return {
       kind: "error",
-      status: lastStatus,
-      message: lastData.error ?? `Send failed with HTTP ${lastStatus}.`,
+      status: result.status,
+      message: result.data.error ?? `Send failed with HTTP ${result.status}.`,
       wallet,
     };
   } catch (error) {
@@ -508,6 +554,66 @@ export async function sendMessage(
       message: (error as Error).message,
     };
   }
+}
+
+export async function sendMessageWithRecovery(
+  baseUrl: string,
+  to: string,
+  text: string,
+  options: SendOptions = {},
+): Promise<SendSuccess | SendError> {
+  const clientMessageId =
+    options.clientMessageId?.trim() || defaultClientMessageId();
+  const sendOptions = { ...options, clientMessageId };
+  const sendStartedAt = Date.now() - 5000;
+  const first = await sendMessage(baseUrl, to, text, sendOptions);
+  if (first.kind === "sent") return first;
+
+  if (!isAmbiguousSendFailure(first.status) && first.status !== 429) {
+    return first;
+  }
+
+  const recoveredId = await recoverSentMessageId(baseUrl, to, text, {
+    correlationId: sendOptions.correlationId,
+    clientMessageId,
+    sinceMs: sendStartedAt,
+  });
+  if (!recoveredId) {
+    if (isAmbiguousSendFailure(first.status)) {
+      return {
+        ...first,
+        message: `${first.message} Message may already be queued — poll: marshell status --ids <id> or marshell history --with ${to}`,
+      };
+    }
+    return first;
+  }
+
+  const status = await fetchMessageStatus(baseUrl, [recoveredId], 0);
+  const wallet = await fetchWallet(baseUrl);
+  if (status.kind === "ok" && status.receipts.length > 0) {
+    if (wallet.kind !== "ok") {
+      return {
+        kind: "error",
+        message: "Recovered message id but wallet check failed.",
+        recovered_id: recoveredId,
+      };
+    }
+    return {
+      kind: "sent",
+      id: recoveredId,
+      status: status.receipts[0]?.status ?? "delivered",
+      wallet: wallet.wallet,
+      poll_status: `/v1/messages/status?ids=${recoveredId}`,
+      correlation_id: sendOptions.correlationId,
+      client_message_id: clientMessageId,
+    };
+  }
+
+  return {
+    ...first,
+    recovered_id: recoveredId,
+    message: `${first.message} Recovered id ${recoveredId} — poll: marshell status --ids ${recoveredId}`,
+  };
 }
 
 export async function fetchInbox(
@@ -649,6 +755,7 @@ export type HistoryMessage = {
   text: string;
   created_at: string;
   correlation_id?: string;
+  client_message_id?: string;
 };
 
 export async function fetchMessageStatus(
@@ -805,7 +912,7 @@ export async function askAgent(
     }
   }
 
-  const sent = await sendMessage(baseUrl, to, text, {
+  const sent = await sendMessageWithRecovery(baseUrl, to, text, {
     correlationId: opts.correlationId,
   });
   if (sent.kind !== "sent") {

@@ -7,6 +7,7 @@ const node_child_process_1 = require("node:child_process");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const network_1 = require("./network");
+const notify_1 = require("./notify");
 const pending_1 = require("./pending");
 const relay_state_1 = require("./relay-state");
 const DEFAULT_REPLY_TIMEOUT_MS = 120_000;
@@ -259,31 +260,6 @@ async function generateRuntimeReply(msg, runtime, workspace, timeoutMs) {
     }
     return result.stdout.trim();
 }
-async function runNotifyCommand(notify, msg, pending) {
-    const payload = JSON.stringify({
-        event: "message",
-        id: msg.id,
-        from: msg.from,
-        text: msg.text,
-        created_at: msg.created_at,
-        pending: pending ?? undefined,
-    });
-    const timeoutMs = 30_000;
-    if (process.platform === "win32") {
-        const result = await spawnCommand("cmd.exe", ["/d", "/s", "/c", notify], { input: payload, timeoutMs });
-        if (result.code !== 0) {
-            throw new Error(result.stderr || result.stdout || "notify failed");
-        }
-        return;
-    }
-    const result = await spawnCommand("sh", ["-c", notify], {
-        input: payload,
-        timeoutMs,
-    });
-    if (result.code !== 0) {
-        throw new Error(result.stderr || result.stdout || "notify failed");
-    }
-}
 async function runHookReply(hook, msg, timeoutMs) {
     const payload = JSON.stringify({
         id: msg.id,
@@ -399,7 +375,7 @@ async function handleInbound(networkUrl, msg, options) {
     // Push to human channel. On failure, leave message in inbox for `relay cron`.
     if (options.notify && !isEcho(msg.from, msg.text)) {
         try {
-            await runNotifyCommand(options.notify, msg, pending);
+            await (0, notify_1.runNotifyWithRetry)(options.notify, msg, pending);
             emitEvent(options.json, {
                 type: "notify",
                 from: msg.from,
