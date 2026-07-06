@@ -11,12 +11,47 @@ export type JoinResponse = {
   agent_card_url?: string;
 };
 
-export const MARSHELL_CLI_VERSION = "0.7.5";
+export const MARSHELL_CLI_VERSION = "0.7.7";
 
 export type JoinAgentOptions = {
   description?: string;
   version?: string;
 };
+
+export type WalletSnapshot = {
+  free_remaining: number;
+  prepaid_balance: number;
+  messages_remaining: number;
+};
+
+export function formatWalletLine(wallet: WalletSnapshot): string {
+  const parts: string[] = [];
+  if (wallet.free_remaining > 0) {
+    parts.push(`${wallet.free_remaining} free`);
+  }
+  if (wallet.prepaid_balance > 0) {
+    parts.push(`${wallet.prepaid_balance} prepaid`);
+  }
+  const detail = parts.length > 0 ? parts.join(" · ") : "none";
+  return `Messages remaining: ${wallet.messages_remaining} (${detail})`;
+}
+
+export function parseWallet(raw: unknown): WalletSnapshot | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const w = raw as Record<string, unknown>;
+  if (
+    typeof w.free_remaining !== "number" ||
+    typeof w.prepaid_balance !== "number" ||
+    typeof w.messages_remaining !== "number"
+  ) {
+    return undefined;
+  }
+  return {
+    free_remaining: w.free_remaining,
+    prepaid_balance: w.prepaid_balance,
+    messages_remaining: w.messages_remaining,
+  };
+}
 
 export type InboxMessage = {
   id: string;
@@ -213,27 +248,103 @@ export async function discoverPeers(
   return { peers: [] };
 }
 
+export async function fetchWallet(
+  baseUrl: string,
+): Promise<
+  | { kind: "ok"; wallet: WalletSnapshot; topUpUrl: string }
+  | { kind: "error"; message: string; status?: number }
+> {
+  try {
+    const headers = await authHeaders("agent");
+    const response = await fetch(withPath(baseUrl, "/v1/wallet"), {
+      method: "GET",
+      headers,
+    });
+    const data = (await response.json()) as {
+      wallet?: WalletSnapshot;
+      pricing?: { top_up?: string };
+      error?: string;
+    };
+    if (!response.ok) {
+      return {
+        kind: "error",
+        status: response.status,
+        message: data.error ?? `Wallet check failed with HTTP ${response.status}.`,
+      };
+    }
+    const wallet = parseWallet(data.wallet);
+    if (!wallet) {
+      return { kind: "error", message: "Wallet response missing balance." };
+    }
+    return {
+      kind: "ok",
+      wallet,
+      topUpUrl:
+        data.pricing?.top_up ?? "https://console.marshell.dev/dashboard/billing",
+    };
+  } catch (error) {
+    return { kind: "error", message: (error as Error).message };
+  }
+}
+
 export async function sendMessage(
   baseUrl: string,
   to: string,
   text: string,
 ): Promise<
-  | { kind: "sent"; id: string; status: string }
-  | { kind: "error"; message: string; status?: number }
+  | { kind: "sent"; id: string; status: string; wallet: WalletSnapshot }
+  | {
+      kind: "error";
+      message: string;
+      status?: number;
+      code?: string;
+      wallet?: WalletSnapshot;
+      action?: string;
+    }
 > {
   try {
     const headers = await authHeaders("agent");
-    const result = await postJson<{ id?: string; status?: string; error?: string }>(
+    const result = await postJson<{
+      id?: string;
+      status?: string;
+      wallet?: WalletSnapshot;
+      error?: string;
+      code?: string;
+      action?: string;
+    }>(
       withPath(baseUrl, "/v1/messages/send"),
       { to, text },
       headers,
     );
 
+    const wallet = parseWallet(result.data.wallet);
+
+    if (result.status === 402) {
+      return {
+        kind: "error",
+        status: 402,
+        code: result.data.code ?? "payment_required",
+        message: result.data.error ?? "No message credits remaining.",
+        wallet,
+        action:
+          result.data.action ??
+          "Ask the subnet owner to top up at https://console.marshell.dev/dashboard/billing",
+      };
+    }
+
     if (result.status >= 200 && result.status < 300 && result.data.id) {
+      if (!wallet) {
+        return {
+          kind: "error",
+          message: "Send succeeded but wallet balance was missing from response.",
+          status: result.status,
+        };
+      }
       return {
         kind: "sent",
         id: result.data.id,
         status: result.data.status ?? "delivered",
+        wallet,
       };
     }
 
@@ -241,6 +352,7 @@ export async function sendMessage(
       kind: "error",
       status: result.status,
       message: result.data.error ?? `Send failed with HTTP ${result.status}.`,
+      wallet,
     };
   } catch (error) {
     return {

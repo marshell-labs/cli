@@ -20,6 +20,7 @@ function printHelp() {
         "  marshell agent run            (alias for bridge run)",
         "  marshell discover [--json] [--a2a]",
         "  marshell send --to <name> --text \"...\" [--track [context]] [--json]",
+        "  marshell wallet [--json]",
         "  marshell ask --to <name> --text \"...\" [--wait <seconds>] [--json]",
         "  marshell inbox [--json] [--wait <seconds>] [--from <name>]",
         "  marshell history [--with <name>] [--limit <n>] [--json]",
@@ -256,9 +257,36 @@ async function cmdSend(args) {
     }
     if (result.kind === "sent") {
         process.stdout.write(`Sent message to '${to}' (id: ${result.id}, status: ${result.status}).\n`);
+        process.stdout.write(`${(0, network_1.formatWalletLine)(result.wallet)}\n`);
+        if (result.wallet.messages_remaining <= 10) {
+            process.stdout.write("Low balance — tell the owner to top up at https://console.marshell.dev/dashboard/billing\n");
+        }
         if (trackContext) {
             process.stdout.write(`Tracking reply from '${to}' (${trackContext}).\n`);
         }
+        return;
+    }
+    if (result.wallet) {
+        process.stderr.write(`${(0, network_1.formatWalletLine)(result.wallet)}\n`);
+    }
+    if (result.status === 402) {
+        printError(`${result.message} ${result.action ?? "Top up at console.marshell.dev/dashboard/billing"}`);
+        return;
+    }
+    printError(result.message);
+}
+async function cmdWallet(args) {
+    const json = hasFlag(args, "--json");
+    const config = await (0, config_1.readConfig)();
+    const networkUrl = (0, config_1.getNetworkUrl)(config);
+    const result = await (0, network_1.fetchWallet)(networkUrl);
+    if (json) {
+        printJson(result);
+        return;
+    }
+    if (result.kind === "ok") {
+        process.stdout.write(`${(0, network_1.formatWalletLine)(result.wallet)}\n`);
+        process.stdout.write(`Top up: ${result.topUpUrl}\n`);
         return;
     }
     printError(result.message);
@@ -497,6 +525,10 @@ async function main() {
     }
     if (args[0] === "discover") {
         await cmdDiscover(args.slice(1));
+        return;
+    }
+    if (args[0] === "wallet") {
+        await cmdWallet(args.slice(1));
         return;
     }
     if (args[0] === "send") {

@@ -1,9 +1,12 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.MARSHELL_CLI_VERSION = void 0;
+exports.formatWalletLine = formatWalletLine;
+exports.parseWallet = parseWallet;
 exports.pingNetwork = pingNetwork;
 exports.joinAgent = joinAgent;
 exports.discoverPeers = discoverPeers;
+exports.fetchWallet = fetchWallet;
 exports.sendMessage = sendMessage;
 exports.fetchInbox = fetchInbox;
 exports.ackMessages = ackMessages;
@@ -12,7 +15,33 @@ exports.fetchHistory = fetchHistory;
 exports.askAgent = askAgent;
 exports.toWsUrl = toWsUrl;
 const config_1 = require("./config");
-exports.MARSHELL_CLI_VERSION = "0.7.5";
+exports.MARSHELL_CLI_VERSION = "0.7.7";
+function formatWalletLine(wallet) {
+    const parts = [];
+    if (wallet.free_remaining > 0) {
+        parts.push(`${wallet.free_remaining} free`);
+    }
+    if (wallet.prepaid_balance > 0) {
+        parts.push(`${wallet.prepaid_balance} prepaid`);
+    }
+    const detail = parts.length > 0 ? parts.join(" · ") : "none";
+    return `Messages remaining: ${wallet.messages_remaining} (${detail})`;
+}
+function parseWallet(raw) {
+    if (!raw || typeof raw !== "object")
+        return undefined;
+    const w = raw;
+    if (typeof w.free_remaining !== "number" ||
+        typeof w.prepaid_balance !== "number" ||
+        typeof w.messages_remaining !== "number") {
+        return undefined;
+    }
+    return {
+        free_remaining: w.free_remaining,
+        prepaid_balance: w.prepaid_balance,
+        messages_remaining: w.messages_remaining,
+    };
+}
 function normalizeBaseUrl(raw) {
     return raw.endsWith("/") ? raw.slice(0, -1) : raw;
 }
@@ -155,21 +184,71 @@ async function discoverPeers(baseUrl) {
     }
     return { peers: [] };
 }
+async function fetchWallet(baseUrl) {
+    try {
+        const headers = await authHeaders("agent");
+        const response = await fetch(withPath(baseUrl, "/v1/wallet"), {
+            method: "GET",
+            headers,
+        });
+        const data = (await response.json());
+        if (!response.ok) {
+            return {
+                kind: "error",
+                status: response.status,
+                message: data.error ?? `Wallet check failed with HTTP ${response.status}.`,
+            };
+        }
+        const wallet = parseWallet(data.wallet);
+        if (!wallet) {
+            return { kind: "error", message: "Wallet response missing balance." };
+        }
+        return {
+            kind: "ok",
+            wallet,
+            topUpUrl: data.pricing?.top_up ?? "https://console.marshell.dev/dashboard/billing",
+        };
+    }
+    catch (error) {
+        return { kind: "error", message: error.message };
+    }
+}
 async function sendMessage(baseUrl, to, text) {
     try {
         const headers = await authHeaders("agent");
         const result = await postJson(withPath(baseUrl, "/v1/messages/send"), { to, text }, headers);
+        const wallet = parseWallet(result.data.wallet);
+        if (result.status === 402) {
+            return {
+                kind: "error",
+                status: 402,
+                code: result.data.code ?? "payment_required",
+                message: result.data.error ?? "No message credits remaining.",
+                wallet,
+                action: result.data.action ??
+                    "Ask the subnet owner to top up at https://console.marshell.dev/dashboard/billing",
+            };
+        }
         if (result.status >= 200 && result.status < 300 && result.data.id) {
+            if (!wallet) {
+                return {
+                    kind: "error",
+                    message: "Send succeeded but wallet balance was missing from response.",
+                    status: result.status,
+                };
+            }
             return {
                 kind: "sent",
                 id: result.data.id,
                 status: result.data.status ?? "delivered",
+                wallet,
             };
         }
         return {
             kind: "error",
             status: result.status,
             message: result.data.error ?? `Send failed with HTTP ${result.status}.`,
+            wallet,
         };
     }
     catch (error) {
