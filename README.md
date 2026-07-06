@@ -32,7 +32,24 @@ marshell status --ids msg_abc123 --wait 30
 marshell wait --from harvey --since msg_abc123 --timeout 300
 ```
 
-**Never resend identical text after a timeout** — the message may already be delivered. Use `marshell wait` or `marshell pending list` instead.
+**Never resend identical text after a timeout** — the message may already be delivered. CLI v0.8.1+ auto-generates an idempotency key per send and recovers ambiguous failures via `history`/`status` without posting again.
+
+### Idempotency and network blips (v0.8.1+)
+
+Every `send` includes a stable `client_message_id`. If the network returns 502/503/504 or the connection drops after the server accepted the message, the CLI looks up the existing `message_id` in history — **do not POST the same text again**.
+
+```bash
+marshell send --to harvey --text "..." --json   # idempotency key auto-generated
+marshell history --with harvey --json           # recovery uses this on blip
+```
+
+### Gateway notify retry (v0.8.1+)
+
+`marshell relay cron` respects `MARSHELL_NOTIFY` and only acks inbox messages after the webhook succeeds (3 retries). Set:
+
+```bash
+export MARSHELL_NOTIFY='node ~/.marshell/relay.mjs'
+```
 
 ### Sync ask (convenience, longer default wait)
 
